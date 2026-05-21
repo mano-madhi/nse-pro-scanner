@@ -33,7 +33,15 @@ jobs:
           printf "SHEETS_DOC_NAME=%s\n" "${{ secrets.SHEETS_DOC_NAME }}" >> .env
           printf "SHEETS_CRED_FILE=service_account.json\n" >> .env
           echo '${{ secrets.SHEETS_CRED_JSON }}' > service_account.json
-      - run: python scanner.py ${{ github.event.inputs.mode || 'scan' }} ${{ github.event.inputs.symbol || '' }}
+      - run: |
+  python scanner.py ${{ github.event.inputs.mode || 'scan' }} ${{ github.event.inputs.symbol || '' }}
+  python -c "
+import os, requests
+token = os.environ.get('TELEGRAM_TOKEN', '')
+chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
+r = requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': '✅ NSE Pro Scanner is connected and working! Your scanner ran successfully on GitHub.'})
+print('Telegram test:', r.status_code, r.text)
+"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
