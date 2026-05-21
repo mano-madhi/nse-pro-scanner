@@ -20,8 +20,8 @@
 ║    < 13   →  No signal                                                  ║
 ║                                                                          ║
 ║  Install:                                                                ║
-║    pip install yfinance pandas pandas-ta requests gspread               ║
-║               oauth2client python-dotenv beautifulsoup4 lxml            ║
+║    pip install yfinance pandas ta requests gspread                      ║
+║               oauth2client python-dotenv beautifulsoup4 lxml numpy      ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -31,7 +31,8 @@ from pathlib import Path
 
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
+import ta as ta_lib
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -515,36 +516,34 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     v = df["Volume"].squeeze()
 
     # ── EMAs (the full stack) ─────────────────────────────────────────────────
-    df["ema9"]   = ta.ema(c, length=9)
-    df["ema20"]  = ta.ema(c, length=20)
-    df["ema50"]  = ta.ema(c, length=50)
-    df["ema200"] = ta.ema(c, length=200)
+    df["ema9"]   = ta_lib.trend.ema_indicator(c, window=9)
+    df["ema20"]  = ta_lib.trend.ema_indicator(c, window=20)
+    df["ema50"]  = ta_lib.trend.ema_indicator(c, window=50)
+    df["ema200"] = ta_lib.trend.ema_indicator(c, window=200)
 
     # ── Momentum ──────────────────────────────────────────────────────────────
-    df["rsi"]    = ta.rsi(c, length=14)
+    df["rsi"] = ta_lib.momentum.rsi(c, window=14)
 
-    macd = ta.macd(c, fast=12, slow=26, signal=9)
-    if macd is not None and not macd.empty:
-        df["macd"]      = macd.iloc[:, 0]
-        df["macd_sig"]  = macd.iloc[:, 1]
-        df["macd_hist"] = macd.iloc[:, 2]
+    # MACD
+    macd_ind = ta_lib.trend.MACD(c, window_slow=26, window_fast=12, window_sign=9)
+    df["macd"]      = macd_ind.macd()
+    df["macd_sig"]  = macd_ind.macd_signal()
+    df["macd_hist"] = macd_ind.macd_diff()
 
-    # Stochastic RSI — for overbought/oversold confirmation
-    stoch = ta.stochrsi(c, length=14, rsi_length=14, k=3, d=3)
-    if stoch is not None and not stoch.empty:
-        df["stoch_k"] = stoch.iloc[:, 0]
-        df["stoch_d"] = stoch.iloc[:, 1]
+    # Stochastic RSI
+    stoch_rsi = ta_lib.momentum.StochRSIIndicator(c, window=14, smooth1=3, smooth2=3)
+    df["stoch_k"] = stoch_rsi.stochrsi_k()
+    df["stoch_d"] = stoch_rsi.stochrsi_d()
 
     # ── Volatility ────────────────────────────────────────────────────────────
-    df["atr"] = ta.atr(h, l, c, length=14)
+    df["atr"] = ta_lib.volatility.average_true_range(h, l, c, window=14)
 
     # Bollinger Bands
-    bb = ta.bbands(c, length=20, std=2)
-    if bb is not None and not bb.empty:
-        df["bb_upper"] = bb.iloc[:, 0]
-        df["bb_lower"] = bb.iloc[:, 1]
-        df["bb_mid"]   = bb.iloc[:, 2]
-        df["bb_width"] = (bb.iloc[:, 0] - bb.iloc[:, 1]) / bb.iloc[:, 2]
+    bb_ind = ta_lib.volatility.BollingerBands(c, window=20, window_dev=2)
+    df["bb_upper"] = bb_ind.bollinger_hband()
+    df["bb_lower"] = bb_ind.bollinger_lband()
+    df["bb_mid"]   = bb_ind.bollinger_mavg()
+    df["bb_width"] = bb_ind.bollinger_wband()
 
     # ── Volume ────────────────────────────────────────────────────────────────
     df["vol20"]  = v.rolling(20).mean()
@@ -552,13 +551,12 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["volrat"] = v / df["vol20"]
 
     # On Balance Volume — smart money accumulation
-    df["obv"] = ta.obv(c, v)
-    df["obv_ema"] = ta.ema(df["obv"], length=20)
+    df["obv"]     = ta_lib.volume.on_balance_volume(c, v)
+    df["obv_ema"] = ta_lib.trend.ema_indicator(df["obv"], window=20)
 
     # ── Trend strength ────────────────────────────────────────────────────────
-    adx_df = ta.adx(h, l, c, length=14)
-    if adx_df is not None and not adx_df.empty:
-        df["adx"] = adx_df.iloc[:, 0]
+    adx_ind   = ta_lib.trend.ADXIndicator(h, l, c, window=14)
+    df["adx"] = adx_ind.adx()
 
     return df
 
