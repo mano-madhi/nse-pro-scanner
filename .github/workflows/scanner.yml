@@ -1,0 +1,42 @@
+name: NSE Pro Scanner
+
+on:
+  schedule:
+    - cron: "50 3 * * 1-5"    # 09:20 AM IST
+    - cron: "30 9 * * 1-5"    # 03:00 PM IST
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "scan / watch / test / fundamentals"
+        default: "scan"
+      symbol:
+        description: "Symbol for test mode"
+        default: "HDFCBANK"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+      - run: pip install -r requirements.txt
+      - name: Write secrets
+        run: |
+          printf "TELEGRAM_TOKEN=%s\n" "${{ secrets.TELEGRAM_TOKEN }}" >> .env
+          printf "TELEGRAM_CHAT_ID=%s\n" "${{ secrets.TELEGRAM_CHAT_ID }}" >> .env
+          printf "SHEETS_DOC_NAME=%s\n" "${{ secrets.SHEETS_DOC_NAME }}" >> .env
+          printf "SHEETS_CRED_FILE=service_account.json\n" >> .env
+          echo '${{ secrets.SHEETS_CRED_JSON }}' > service_account.json
+      - run: python scanner.py ${{ github.event.inputs.mode || 'scan' }} ${{ github.event.inputs.symbol || '' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: log-${{ github.run_id }}
+          path: scanner.log
+          retention-days: 14
