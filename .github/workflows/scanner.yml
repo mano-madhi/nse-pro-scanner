@@ -2,35 +2,41 @@ name: NSE Pro Scanner
 
 on:
   schedule:
-    - cron: "50 3 * * 1-5"    # 09:20 AM IST
-    - cron: "30 9 * * 1-5"    # 03:00 PM IST
+    - cron: "50 3 * * 1-5"
+    - cron: "30 9 * * 1-5"
   workflow_dispatch:
     inputs:
       mode:
-        description: "scan / test / fundamentals / telegram_test"
-        default: "scan"
+        description: "Mode: scan, test, telegram_test, fundamentals"
+        required: true
+        default: "telegram_test"
+        type: choice
+        options:
+          - telegram_test
+          - test
+          - scan
+          - fundamentals
       symbol:
-        description: "Symbol for test mode"
+        description: "Stock symbol (for test mode only)"
+        required: false
         default: "HDFCBANK"
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      SHEETS_DOC_NAME: ${{ secrets.SHEETS_DOC_NAME }}
-      SHEETS_CRED_FILE: service_account.json
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - uses: actions/cache@v4
+      - name: Cache pip
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
@@ -38,42 +44,58 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Write secrets to .env
+      - name: Write .env file
         run: |
-          printf "TELEGRAM_TOKEN=%s\n" "${{ secrets.TELEGRAM_TOKEN }}" >> .env
-          printf "TELEGRAM_CHAT_ID=%s\n" "${{ secrets.TELEGRAM_CHAT_ID }}" >> .env
-          printf "SHEETS_DOC_NAME=%s\n" "${{ secrets.SHEETS_DOC_NAME }}" >> .env
-          printf "SHEETS_CRED_FILE=service_account.json\n" >> .env
+          echo "TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}" >> .env
+          echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> .env
+          echo "SHEETS_DOC_NAME=${{ secrets.SHEETS_DOC_NAME }}" >> .env
+          echo "SHEETS_CRED_FILE=service_account.json" >> .env
 
-      - name: Write Google Sheets credentials
+      - name: Write Sheets credentials
         run: echo '${{ secrets.SHEETS_CRED_JSON }}' > service_account.json
 
-      - name: Test Telegram connection
-        if: github.event.inputs.mode == 'telegram_test'
+      - name: Run Telegram test
+        if: ${{ github.event.inputs.mode == 'telegram_test' }}
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python -c "
-import os, requests
-token   = os.environ.get('TELEGRAM_TOKEN', '')
-chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
-print(f'Token present: {bool(token)}')
-print(f'Chat ID present: {bool(chat_id)}')
-r = requests.post(
-    f'https://api.telegram.org/bot{token}/sendMessage',
-    json={'chat_id': chat_id, 'text': '✅ NSE Pro Scanner is LIVE!\n\nYour Telegram alerts are working.\nScanner runs at 9:20 AM and 3:00 PM IST every market day. 🚀'},
-    timeout=10
-)
-print('Status:', r.status_code)
-print('Response:', r.text)
-"
+          python - <<'PYEOF'
+          import os, requests
+          token   = os.environ.get("TELEGRAM_TOKEN", "")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+          print(f"Token present: {bool(token)}")
+          print(f"Chat ID present: {bool(chat_id)}")
+          msg = (
+              "✅ NSE Pro Scanner is LIVE!\n\n"
+              "Your Telegram alerts are working perfectly.\n"
+              "Scanner will run automatically at:\n"
+              "📅 9:20 AM IST — Morning scan\n"
+              "📅 3:00 PM IST — Pre-close scan\n\n"
+              "Every market day. No action needed from you! 🚀"
+          )
+          r = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              json={"chat_id": chat_id, "text": msg},
+              timeout=10
+          )
+          print("Status:", r.status_code)
+          print("Response:", r.json())
+          if r.status_code == 200:
+              print("✅ Telegram message sent successfully!")
+          else:
+              print("❌ Failed to send message")
+              exit(1)
+          PYEOF
 
       - name: Run scanner
-        if: github.event.inputs.mode != 'telegram_test'
+        if: ${{ github.event.inputs.mode != 'telegram_test' }}
         run: python scanner.py ${{ github.event.inputs.mode || 'scan' }} ${{ github.event.inputs.symbol || '' }}
 
       - name: Upload log
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: log-${{ github.run_id }}
+          name: scanner-log-${{ github.run_id }}
           path: scanner.log
           retention-days: 14
