@@ -153,23 +153,162 @@ def sector_of(sym):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 2.  SCREENER.IN — DEEP FUNDAMENTAL DATA
-#     Pulls: ROE, ROCE, Net Margin, Debt/Equity, Interest Coverage,
-#            EPS growth, FCF, Promoter Holding, Promoter Pledging,
-#            Piotroski Score
+# 2.  FUNDAMENTAL DATA — yfinance PRIMARY + Screener.in FALLBACK
+#     yfinance works reliably from GitHub Actions (no blocking)
+#     Screener.in used as optional enhancement when available
 # ════════════════════════════════════════════════════════════════════════════
 
-_SCREENER_CACHE: dict = {}
+_FUND_CACHE: dict = {}
 
 def _parse_num(text: str) -> float | None:
-    """Clean and parse a number string from Screener."""
+    """Clean and parse a number string."""
     if not text:
         return None
-    text = text.replace(",","").replace("%","").replace("₹","").strip()
+    text = str(text).replace(",","").replace("%","").replace("₹","").strip()
     try:
         return float(text)
     except:
         return None
+
+
+def fetch_fundamentals(symbol: str) -> dict:
+    """
+    Fetch fundamentals using yfinance as primary source.
+    Reliable from GitHub Actions — no blocking issues.
+    """
+    if symbol in _FUND_CACHE:
+        return _FUND_CACHE[symbol]
+
+    data = {"symbol": symbol}
+    ticker = nse(symbol)
+
+    try:
+        tk   = yf.Ticker(ticker)
+        info = tk.info or {}
+
+        # ── Core metrics from yfinance info ──────────────────────────────────
+        data["roe"]             = _parse_num(info.get("returnOnEquity"))
+        data["de"]              = _parse_num(info.get("debtToEquity"))
+        data["current_ratio"]   = _parse_num(info.get("currentRatio"))
+        data["pe"]              = _parse_num(info.get("trailingPE"))
+        data["market_cap_cr"]   = (info.get("marketCap") or 0) / 1e7
+        data["rev_growth_pct"]  = (_parse_num(info.get("revenueGrowth")) or 0) * 100
+        data["net_margin_latest"]= (_parse_num(info.get("profitMargins")) or 0) * 100
+        data["eps_growth_yoy"]  = (_parse_num(info.get("earningsGrowth")) or 0) * 100
+        data["promoter_holding"]= (_parse_num(info.get("heldPercentInsiders")) or 0) * 100
+        data["div_yield"]       = (_parse_num(info.get("dividendYield")) or 0) * 100
+        data["book_value"]      = _parse_num(info.get("bookValue"))
+        data["52w_high"]        = _parse_num(info.get("fiftyTwoWeekHigh"))
+        data["52w_low"]         = _parse_num(info.get("fiftyTwoWeekLow"))
+
+        # Convert ROE from decimal to percentage if needed
+        roe = data.get("roe")
+        if roe and abs(roe) < 5:
+            data["roe"] = roe * 100
+
+        # Convert D/E — yfinance gives it as percentage sometimes
+        de = data.get("de")
+        if de and de > 20:
+            data["de"] = de / 100
+
+        # ── FCF from cashflow statement ───────────────────────────────────────
+        try:
+            cf = tk.cashflow
+            if cf is not None and not cf.empty:
+                cfo_row   = None
+                capex_row = None
+                for idx in cf.index:
+                    idx_lower = str(idx).lower()
+                    if "operating" in idx_lower and "cash" in idx_lower:
+                        cfo_row = idx
+                    if "capital" in idx_lower or "capex" in idx_lower:
+                        capex_row = idx
+                if cfo_row is not None:
+                    cfo = float(cf.loc[cfo_row].iloc[0]) / 1e7
+                    data["cfo"] = round(cfo, 1)
+                    if capex_row is not None:
+                        capex = float(cf.loc[capex_row].iloc[0]) / 1e7
+                        data["fcf"] = round(cfo + capex, 1)
+                    else:
+                        data["fcf"] = round(cfo, 1)
+        except Exception:
+            pass
+
+        # ── ROCE proxy from financials ─────────────────────────────────────────
+        try:
+            fin = tk.financials
+            if fin is not None and not fin.empty:
+                ebit_row = None
+                for idx in fin.index:
+                    if "ebit" in str(idx).lower() or "operating income" in str(idx).lower():
+                        ebit_row = idx
+                        break
+                bs = tk.balance_sheet
+                if ebit_row is not None and bs is not None and not bs.empty:
+                    ebit = float(fin.loc[ebit_row].iloc[0])
+                    total_assets = None
+                    current_liab = None
+                    for idx in bs.index:
+                        il = str(idx).lower()
+                        if "total assets" in il:
+                            total_assets = float(bs.loc[idx].iloc[0])
+                        if "current liabilities" in il:
+                            current_liab = float(bs.loc[idx].iloc[0])
+                    if total_assets and current_liab:
+                        capital_employed = total_assets - current_liab
+                        if capital_employed > 0:
+                            data["roce"] = round(ebit / capital_employed * 100, 1)
+        except Exception:
+            pass
+
+        # ── Interest coverage proxy ───────────────────────────────────────────
+        try:
+            fin = tk.financials
+            if fin is not None and not fin.empty:
+                ebit_val = int_exp = None
+                for idx in fin.index:
+                    il = str(idx).lower()
+                    if "ebit" in il or "operating income" in il:
+                        ebit_val = float(fin.loc[idx].iloc[0])
+                    if "interest expense" in il:
+                        int_exp = abs(float(fin.loc[idx].iloc[0]))
+                if ebit_val and int_exp and int_exp > 0:
+                    data["interest_coverage"] = round(ebit_val / int_exp, 1)
+                elif int_exp == 0 or int_exp is None:
+                    data["interest_coverage"] = 99
+        except Exception:
+            pass
+
+        # ── Piotroski F-Score ─────────────────────────────────────────────────
+        fscore = 0
+        if (data.get("net_margin_latest") or 0) > 0:  fscore += 1
+        if (data.get("cfo") or 0) > 0:                fscore += 1
+        if (data.get("eps_growth_yoy") or 0) > 0:     fscore += 1
+        if (data.get("cfo") or 0) > (data.get("net_margin_latest") or 0): fscore += 1
+        de2 = data.get("de")
+        if de2 is not None and de2 < 1:               fscore += 1
+        if (data.get("current_ratio") or 0) > 1:      fscore += 1
+        if (data.get("net_margin_latest") or 0) > 8:  fscore += 1
+        if (data.get("rev_growth_pct") or 0) > 0:     fscore += 1
+        data["piotroski"] = fscore
+
+        # ── Promoter pledging (yfinance doesn't have this — set safe default) ─
+        # Screener.in would give this but may be blocked on cloud
+        # We'll treat None as "unknown" and not hard-reject on it
+        data["promoter_pledging"] = None
+
+        log.info(f"  Fundamentals OK via yfinance: ROE={data.get('roe'):.1f}% D/E={data.get('de')} RevGrow={data.get('rev_growth_pct'):.1f}%"
+                 if data.get("roe") and data.get("de") and data.get("rev_growth_pct") else
+                 f"  Fundamentals fetched (some fields may be missing)")
+
+    except Exception as e:
+        log.warning(f"yfinance fundamentals failed for {symbol}: {e}")
+        _FUND_CACHE[symbol] = {}
+        return {}
+
+    _FUND_CACHE[symbol] = data
+    time.sleep(0.3)
+    return data
 
 
 def fetch_screener(symbol: str) -> dict:
@@ -1322,8 +1461,8 @@ def run_scan(label="Morning Scan"):
         sector = sector_of(symbol)
         log.info(f"[{i+1:3}/{len(ALL_STOCKS)}] {symbol:15} ({sector[:20]})")
 
-        # ── Tier 1: Fundamentals (Screener.in) ───────────────────────────────
-        fd = fetch_screener(symbol)
+        # ── Tier 1: Fundamentals (yfinance) ──────────────────────────────────
+        fd = fetch_fundamentals(symbol)
         passes, reason, f_score, f_card = fundamental_score(symbol, sector, fd)
         if not passes:
             log.info(f"         ✗ Fundamental: {reason}")
@@ -1420,7 +1559,7 @@ if __name__ == "__main__":
         log.info(f"TEST MODE — {sym}")
         sector = sector_of(sym)
 
-        fd = fetch_screener(sym)
+        fd = fetch_fundamentals(sym)
         passes, reason, f_score, f_card = fundamental_score(sym, sector, fd)
         print(f"\n── Fundamentals ──────────────────────────")
         print(f"Passes: {passes}  Score: {f_score}/12")
@@ -1452,19 +1591,25 @@ if __name__ == "__main__":
                         if sig:
                             print(f"\n── SIGNAL ────────────────────────────────")
                             print(fmt_buy_alert(sig))
+                            _tg(fmt_buy_alert(sig))
                         else:
                             print("\nNo signal — RR ratio too poor or SL invalid.")
+                            _tg(f"🔍 Test: {sym}\nPassed all filters but RR ratio too poor right now.\nNot a good entry today.")
                     else:
                         print("\nNo entry signal at this time.")
+                        _tg(f"🔍 Test: {sym}\nFund ✅ Trend ✅ Entry ✗\nRSI or MACD not in buy zone right now.")
                 else:
                     print("\nTrend filter failed — stock not in buy zone.")
+                    _tg(f"🔍 Test: {sym}\nFund ✅ Trend ✗\nPrice too far from EMA50 or below EMA200.")
+        else:
+            _tg(f"🔍 Test: {sym}\nFundamental filter ✗\nReason: {reason}")
 
     elif mode == "fundamentals":
         log.info(f"Fundamentals-only scan — {len(ALL_STOCKS)} stocks")
         passed = []
         for sym in ALL_STOCKS:
             sec = sector_of(sym)
-            fd  = fetch_screener(sym)
+            fd  = fetch_fundamentals(sym)
             ok, reason, fs, card = fundamental_score(sym, sec, fd)
             status = f"✅ {fs:2}/12  {', '.join(card[:3])}" if ok else f"✗  {reason}"
             print(f"{sym:15} {status}")
