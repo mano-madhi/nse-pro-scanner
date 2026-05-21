@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "scan / watch / test / fundamentals"
+        description: "scan / test / fundamentals / telegram_test"
         default: "scan"
       symbol:
         description: "Symbol for test mode"
@@ -17,32 +17,61 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      SHEETS_DOC_NAME: ${{ secrets.SHEETS_DOC_NAME }}
+      SHEETS_CRED_FILE: service_account.json
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
+
       - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-      - run: pip install -r requirements.txt
-      - name: Write secrets
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write secrets to .env
         run: |
           printf "TELEGRAM_TOKEN=%s\n" "${{ secrets.TELEGRAM_TOKEN }}" >> .env
           printf "TELEGRAM_CHAT_ID=%s\n" "${{ secrets.TELEGRAM_CHAT_ID }}" >> .env
           printf "SHEETS_DOC_NAME=%s\n" "${{ secrets.SHEETS_DOC_NAME }}" >> .env
           printf "SHEETS_CRED_FILE=service_account.json\n" >> .env
-          echo '${{ secrets.SHEETS_CRED_JSON }}' > service_account.json
-      - run: |
-  python scanner.py ${{ github.event.inputs.mode || 'scan' }} ${{ github.event.inputs.symbol || '' }}
-  python -c "
+
+      - name: Write Google Sheets credentials
+        run: echo '${{ secrets.SHEETS_CRED_JSON }}' > service_account.json
+
+      - name: Test Telegram connection
+        if: github.event.inputs.mode == 'telegram_test'
+        run: |
+          python -c "
 import os, requests
-token = os.environ.get('TELEGRAM_TOKEN', '')
+token   = os.environ.get('TELEGRAM_TOKEN', '')
 chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
-r = requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': '✅ NSE Pro Scanner is connected and working! Your scanner ran successfully on GitHub.'})
-print('Telegram test:', r.status_code, r.text)
+print(f'Token present: {bool(token)}')
+print(f'Chat ID present: {bool(chat_id)}')
+r = requests.post(
+    f'https://api.telegram.org/bot{token}/sendMessage',
+    json={'chat_id': chat_id, 'text': '✅ NSE Pro Scanner is LIVE!\n\nYour Telegram alerts are working.\nScanner runs at 9:20 AM and 3:00 PM IST every market day. 🚀'},
+    timeout=10
+)
+print('Status:', r.status_code)
+print('Response:', r.text)
 "
-      - uses: actions/upload-artifact@v4
+
+      - name: Run scanner
+        if: github.event.inputs.mode != 'telegram_test'
+        run: python scanner.py ${{ github.event.inputs.mode || 'scan' }} ${{ github.event.inputs.symbol || '' }}
+
+      - name: Upload log
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: log-${{ github.run_id }}
