@@ -816,8 +816,13 @@ def trend_score(df: pd.DataFrame, fd: dict) -> tuple[bool, int, list]:
     card  = []
 
     def s(key):
-        v = last.get(key, float("nan"))
-        return None if pd.isna(v) else float(v)
+        try:
+            v = last[key]
+            if isinstance(v, pd.Series):
+                v = v.iloc[0]
+            return None if pd.isna(float(v)) else float(v)
+        except:
+            return None
 
     ema9   = s("ema9")
     ema20  = s("ema20")
@@ -893,9 +898,15 @@ def entry_score(df: pd.DataFrame, sr: dict, fd: dict) -> tuple[bool, int, list, 
     card   = []
 
     def s(key, row=None):
-        row = row or last
-        v = row.get(key, float("nan"))
-        return None if pd.isna(v) else float(v)
+        if row is None:
+            row = last
+        try:
+            v = row[key]
+            if isinstance(v, pd.Series):
+                v = v.iloc[0]
+            return None if pd.isna(float(v)) else float(v)
+        except:
+            return None
 
     rsi      = s("rsi")
     macd     = s("macd")
@@ -925,14 +936,18 @@ def entry_score(df: pd.DataFrame, sr: dict, fd: dict) -> tuple[bool, int, list, 
     # ── MACD  (max 2 pts) ─────────────────────────────────────────────────────
     macd_cross = False
     if macd is not None and macd_s is not None:
-        prev_macd = s("macd", prev) or macd
-        prev_sig  = s("macd_sig", prev) or macd_s
+        prev_macd = s("macd", prev)
+        prev_sig  = s("macd_sig", prev)
+        if prev_macd is None: prev_macd = macd
+        if prev_sig  is None: prev_sig  = macd_s
         macd_cross = (prev_macd < prev_sig) and (macd > macd_s)
+        ph = s("macd_hist", prev)
+        ph2 = s("macd_hist", prev2)
         hist_turning = (
             macd_h is not None and
-            s("macd_hist", prev) is not None and
-            s("macd_hist", prev2) is not None and
-            macd_h > s("macd_hist", prev) > s("macd_hist", prev2)
+            ph is not None and
+            ph2 is not None and
+            macd_h > ph > ph2
         )
         if macd_cross:
             score += 2; card.append("MACD bullish crossover ✅ — strong entry signal")
@@ -1455,56 +1470,61 @@ def run_scan(label="Morning Scan"):
         sector = sector_of(symbol)
         log.info(f"[{i+1:3}/{len(ALL_STOCKS)}] {symbol:15} ({sector[:20]})")
 
-        # ── Tier 1: Fundamentals (yfinance) ──────────────────────────────────
-        fd = fetch_fundamentals(symbol)
-        passes, reason, f_score, f_card = fundamental_score(symbol, sector, fd)
-        if not passes:
-            log.info(f"         ✗ Fundamental: {reason}")
-            f_fail += 1
+        try:
+            # ── Tier 1: Fundamentals (yfinance) ──────────────────────────────
+            fd = fetch_fundamentals(symbol)
+            passes, reason, f_score, f_card = fundamental_score(symbol, sector, fd)
+            if not passes:
+                log.info(f"         ✗ Fundamental: {reason}")
+                f_fail += 1
+                continue
+            log.info(f"         ✓ Fundamental score {f_score}/12")
+
+            # ── Tier 2: Trend & EMA Stack ─────────────────────────────────────
+            df = fetch_ohlcv(symbol)
+            if df is None:
+                log.info("         ✗ No price data")
+                continue
+            df = add_indicators(df)
+
+            t_passes, t_score, t_card = trend_score(df, fd)
+            if not t_passes:
+                log.info(f"         ✗ Trend: price too far below EMA200")
+                t_fail += 1
+                continue
+            log.info(f"         ✓ Trend score {t_score}/8")
+
+            # ── Tier 3: Entry Timing ──────────────────────────────────────────
+            sr = find_sr_zones(df)
+            e_passes, e_score, e_card, entry_data = entry_score(df, sr, fd)
+            if not e_passes:
+                log.info(f"         ✗ Entry: RSI overbought or insufficient setup")
+                e_fail += 1
+                continue
+            log.info(f"         ✓ Entry score {e_score}/10")
+
+            # ── Assemble signal ───────────────────────────────────────────────
+            sig = build_signal(symbol, sector, df, fd,
+                               f_score, t_score, e_score, entry_data)
+            if sig is None:
+                log.info(f"         ✗ Signal rejected (RR too poor or SL invalid)")
+                continue
+
+            log.info(
+                f"         ✅ SIGNAL — {sig['conviction']} | "
+                f"Score {sig['total_score']}/30 | "
+                f"Dip {sig['dip_pct']}% | RSI {sig['rsi']:.0f}"
+            )
+
+            # Send Telegram alert immediately
+            _tg(fmt_buy_alert(sig))
+            log_to_sheets(sig)
+            signals.append(sig)
+            time.sleep(0.5)
+
+        except Exception as e:
+            log.error(f"         ⚠️ Unexpected error for {symbol}: {e}")
             continue
-        log.info(f"         ✓ Fundamental score {f_score}/12")
-
-        # ── Tier 2: Trend & EMA Stack ─────────────────────────────────────────
-        df = fetch_ohlcv(symbol)
-        if df is None:
-            log.info("         ✗ No price data")
-            continue
-        df = add_indicators(df)
-
-        t_passes, t_score, t_card = trend_score(df, fd)
-        if not t_passes:
-            log.info(f"         ✗ Trend: price too far below EMA200")
-            t_fail += 1
-            continue
-        log.info(f"         ✓ Trend score {t_score}/8")
-
-        # ── Tier 3: Entry Timing ──────────────────────────────────────────────
-        sr = find_sr_zones(df)
-        e_passes, e_score, e_card, entry_data = entry_score(df, sr, fd)
-        if not e_passes:
-            log.info(f"         ✗ Entry: RSI overbought or insufficient setup")
-            e_fail += 1
-            continue
-        log.info(f"         ✓ Entry score {e_score}/10")
-
-        # ── Assemble signal ───────────────────────────────────────────────────
-        sig = build_signal(symbol, sector, df, fd,
-                           f_score, t_score, e_score, entry_data)
-        if sig is None:
-            log.info(f"         ✗ Signal rejected (RR too poor or SL invalid)")
-            continue
-
-        log.info(
-            f"         ✅ SIGNAL — {sig['conviction']} | "
-            f"Score {sig['total_score']}/30 | "
-            f"Dip {sig['dip_pct']}% | RSI {sig['rsi']:.0f}"
-        )
-
-        # Send Telegram alert immediately
-        _tg(fmt_buy_alert(sig))
-        log_to_sheets(sig)
-        signals.append(sig)
-        time.sleep(0.5)
 
         time.sleep(0.3)
 
