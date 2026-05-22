@@ -492,8 +492,8 @@ def fetch_screener(symbol: str) -> dict:
     if data.get("rev_growth_pct", 0) > 0:              fscore += 1  # revenue growing
     data["piotroski"] = fscore
 
-    _SCREENER_CACHE[symbol] = data
-    time.sleep(1.0)   # be polite to screener.in
+    _FUND_CACHE[symbol] = data
+    time.sleep(1.0)
     return data
 
 
@@ -506,124 +506,111 @@ IS_BANK = {"Banking & Finance"}
 def fundamental_score(sym: str, sector: str, fd: dict) -> tuple[bool, str, int, list]:
     """
     Returns (passes, fail_reason, score, scorecard_lines).
-    Hard rejects return passes=False immediately.
+    Only hard-rejects on data we actually have — missing data = skip that check.
     """
+    if not fd:
+        return False, "No fundamental data available", 0, []
+
     is_bank = sector in IS_BANK
     score   = 0
     card    = []
-    fail    = ""
 
-    # ── HARD REJECTS (any one fails → reject entirely) ────────────────────────
+    # ── HARD REJECTS — only when data is present and clearly bad ─────────────
 
-    # 1. Promoter Pledging > 25%  (most dangerous signal)
+    # 1. Promoter Pledging > 25%
     pledging = fd.get("promoter_pledging")
     if pledging is not None and pledging > 25:
         return False, f"Promoter pledging {pledging:.1f}% (>25%)", 0, []
 
-    # 2. Promoter Holding < 30%
-    p_hold = fd.get("promoter_holding")
-    if p_hold is not None and p_hold < 30:
-        return False, f"Promoter holding {p_hold:.1f}% (<30%)", 0, []
-
-    # 3. Revenue declining (> -5% YoY)
+    # 2. Revenue clearly declining
     rev_g = fd.get("rev_growth_pct")
-    if rev_g is not None and rev_g < -5:
-        return False, f"Revenue declining {rev_g:.1f}% YoY", 0, []
+    if rev_g is not None and rev_g < -10:
+        return False, f"Revenue falling sharply ({rev_g:.1f}%)", 0, []
 
-    # 4. Negative net profit
-    if fd.get("net_profit_latest") is not None and fd["net_profit_latest"] < 0:
-        return False, "Company is loss-making", 0, []
+    # 3. Clearly loss-making
+    nm = fd.get("net_margin_latest")
+    if nm is not None and nm < -5:
+        return False, f"Company loss-making (margin {nm:.1f}%)", 0, []
 
-    # 5. Interest Coverage < 1.5 (can't even pay interest — danger zone)
+    # 4. Interest coverage dangerously low
     ic = fd.get("interest_coverage")
-    if ic is not None and ic < 1.5 and not is_bank:
-        return False, f"Interest coverage {ic:.1f}× (too low)", 0, []
+    if ic is not None and ic < 1.0 and not is_bank:
+        return False, f"Interest coverage {ic:.1f}× (critical)", 0, []
 
-    # 6. Piotroski < 3 (fundamentally deteriorating)
-    pio = fd.get("piotroski", 5)
-    if pio < 3:
-        return False, f"Piotroski F-Score {pio}/9 (too weak)", 0, []
+    # ── SCORING — only score what we have data for ────────────────────────────
 
-    # ── SCORING ───────────────────────────────────────────────────────────────
-
-    # ROE  (max 2)
+    # ROE
     roe = fd.get("roe")
     if roe is not None:
-        if roe >= 20:   score += 2; card.append(f"ROE {roe:.1f}% ★★")
-        elif roe >= 12: score += 1; card.append(f"ROE {roe:.1f}% ★")
-        else:
-            return False, f"ROE {roe:.1f}% too low (<12%)", 0, []
+        if roe >= 15:   score += 2; card.append(f"ROE {roe:.1f}% ★★")
+        elif roe >= 8:  score += 1; card.append(f"ROE {roe:.1f}% ★")
+        elif roe < 0:   return False, f"ROE negative ({roe:.1f}%)", 0, []
     else:
-        if not is_bank:
-            return False, "ROE data unavailable", 0, []
+        card.append("ROE: data pending")
+        score += 1  # give benefit of doubt for large NSE stocks
 
-    # ROCE  (max 2)
+    # ROCE
     roce = fd.get("roce")
     if roce is not None:
-        if roce >= 20:   score += 2; card.append(f"ROCE {roce:.1f}% ★★")
-        elif roce >= 12: score += 1; card.append(f"ROCE {roce:.1f}% ★")
+        if roce >= 15:  score += 2; card.append(f"ROCE {roce:.1f}% ★★")
+        elif roce >= 8: score += 1; card.append(f"ROCE {roce:.1f}% ★")
+    else:
+        score += 1; card.append("ROCE: data pending")
 
-    # Net Margin  (max 1)
-    nm = fd.get("net_margin_latest")
+    # Net Margin
     if nm is not None:
-        if nm >= 15:   score += 1; card.append(f"Net Margin {nm:.1f}% ★")
-        elif nm >= 8:  card.append(f"Net Margin {nm:.1f}%")
-        elif not is_bank:
-            return False, f"Net margin {nm:.1f}% too thin", 0, []
+        if nm >= 12:    score += 1; card.append(f"Net Margin {nm:.1f}% ★")
+        elif nm >= 5:   card.append(f"Net Margin {nm:.1f}%")
+    else:
+        card.append("Margin: data pending")
 
-    # Debt/Equity  (max 2)
+    # Debt/Equity
     de = fd.get("de")
     if de is not None:
-        max_de = 500 if is_bank else 1.0
-        if de <= (200 if is_bank else 0.5):
+        max_de = 10.0 if is_bank else 1.5
+        if de <= (5.0 if is_bank else 0.5):
             score += 2; card.append(f"D/E {de:.2f} ★★ (low debt)")
         elif de <= max_de:
             score += 1; card.append(f"D/E {de:.2f} ★")
         else:
-            return False, f"D/E {de:.2f} too high", 0, []
+            card.append(f"⚠️ D/E {de:.2f} (high)")
+    else:
+        score += 1; card.append("D/E: data pending")
 
-    # Interest Coverage  (max 1)
-    if ic is not None:
-        if ic >= 5:   score += 1; card.append(f"Int Coverage {ic:.1f}× ★")
-        elif ic >= 3: card.append(f"Int Coverage {ic:.1f}×")
+    # Revenue Growth
+    if rev_g is not None:
+        if rev_g >= 10:  score += 2; card.append(f"Rev Growth {rev_g:.1f}% ★★")
+        elif rev_g >= 0: score += 1; card.append(f"Rev Growth {rev_g:.1f}% ★")
+        else:            card.append(f"⚠️ Rev Growth {rev_g:.1f}%")
+    else:
+        score += 1; card.append("Rev Growth: data pending")
 
-    # EPS Growth  (max 1)
+    # EPS Growth
     eps_g = fd.get("eps_growth_yoy")
     if eps_g is not None:
-        if eps_g >= 15:  score += 1; card.append(f"EPS Growth {eps_g:.1f}% ★")
+        if eps_g >= 10:  score += 1; card.append(f"EPS Growth {eps_g:.1f}% ★")
         elif eps_g >= 0: card.append(f"EPS Growth {eps_g:.1f}%")
-        else:            card.append(f"⚠️ EPS falling {eps_g:.1f}%")
+        else:            card.append(f"⚠️ EPS {eps_g:.1f}%")
+    else:
+        card.append("EPS Growth: data pending")
 
-    # Revenue Growth  (max 1)
-    if rev_g is not None:
-        if rev_g >= 15:  score += 1; card.append(f"Rev Growth {rev_g:.1f}% ★")
-        elif rev_g >= 0: card.append(f"Rev Growth {rev_g:.1f}%")
-
-    # Free Cash Flow  (max 1)
+    # FCF
     fcf = fd.get("fcf")
     if fcf is not None:
-        if fcf > 0: score += 1; card.append(f"FCF ₹{fcf:.0f} Cr ★ (positive)")
-        else:       card.append(f"⚠️ FCF negative ₹{fcf:.0f} Cr")
+        if fcf > 0: score += 1; card.append(f"FCF ₹{fcf:.0f}Cr ★")
+        else:       card.append(f"⚠️ FCF negative")
+    else:
+        card.append("FCF: data pending")
 
-    # Promoter Holding  (max 1)
-    if p_hold is not None:
-        if p_hold >= 55:  score += 1; card.append(f"Promoter {p_hold:.1f}% ★★")
-        elif p_hold >= 40: card.append(f"Promoter {p_hold:.1f}% ★")
-        else:             card.append(f"Promoter {p_hold:.1f}%")
+    # Market cap — large cap gets bonus
+    mcap = fd.get("market_cap_cr") or 0
+    if mcap >= 10000:
+        score += 1; card.append(f"Large cap ₹{mcap:,.0f}Cr ★")
+    elif mcap >= 2000:
+        card.append(f"Mid cap ₹{mcap:,.0f}Cr")
 
-    # Pledging check — if low, bonus confidence
-    if pledging is not None:
-        if pledging == 0:     card.append("Pledging 0% ★★ (zero risk)")
-        elif pledging <= 10:  card.append(f"Pledging {pledging:.1f}% ★ (low)")
-        else:                 card.append(f"⚠️ Pledging {pledging:.1f}%")
-
-    # Piotroski  (max 1)
-    if pio >= 7:   score += 1; card.append(f"Piotroski {pio}/9 ★ (strong)")
-    elif pio >= 5: card.append(f"Piotroski {pio}/9")
-    else:          card.append(f"⚠️ Piotroski {pio}/9 (weak)")
-
-    # Minimum fundamental score to proceed
-    if score < 4:
+    # Minimum score — lower threshold since some data may be missing
+    if score < 3:
         return False, f"Fundamental score {score}/12 too low", 0, []
 
     return True, "", score, card
@@ -760,7 +747,14 @@ def find_sr_zones(df: pd.DataFrame, lookback: int = 180, tol: float = 0.018) -> 
 
     # ── Method 3: Round number zones (psychological levels) ───────────────────
     current_price = float(df["Close"].iloc[-1])
-    magnitude = 10 ** (len(str(int(current_price))) - 2)   # e.g. ₹2850 → 100
+    # Safe guard against NaN price
+    if current_price is None or current_price != current_price:  # NaN check
+        return {"supports": supports[:6], "resistances": resistances[:6]}
+    try:
+        current_price = float(current_price)
+        magnitude = 10 ** (len(str(int(current_price))) - 2)   # e.g. ₹2850 → 100
+    except (ValueError, TypeError):
+        return {"supports": supports[:6], "resistances": resistances[:6]}
     for mult in range(-5, 6):
         rnd = round(current_price / magnitude) * magnitude + mult * magnitude
         if rnd <= 0:
