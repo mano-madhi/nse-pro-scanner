@@ -2,24 +2,24 @@ name: NSE Pro Scanner
 
 on:
   schedule:
-    - cron: "50 3 * * 1-5"
-    - cron: "30 9 * * 1-5"
+    - cron: "50 3 * * 1-5"    # 09:20 AM IST (Mon-Fri)
+    - cron: "30 9 * * 1-5"    # 03:00 PM IST (Mon-Fri)
   workflow_dispatch:
     inputs:
       mode:
         description: "Mode: scan, test, telegram_test, fundamentals"
         required: true
-        default: "telegram_test"
+        default: "scan"
         type: choice
         options:
+          - scan
           - telegram_test
           - test
-          - scan
           - fundamentals
       symbol:
         description: "Stock symbol (for test mode only)"
         required: false
-        default: "HDFCBANK"
+        default: "RELIANCE"
 
 jobs:
   scan:
@@ -54,7 +54,7 @@ jobs:
       - name: Write Sheets credentials
         run: echo '${{ secrets.SHEETS_CRED_JSON }}' > service_account.json
 
-      - name: Run Telegram test
+      - name: Run Telegram connection test
         if: ${{ github.event.inputs.mode == 'telegram_test' }}
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -64,15 +64,13 @@ jobs:
           import os, requests
           token   = os.environ.get("TELEGRAM_TOKEN", "")
           chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-          print(f"Token present: {bool(token)}")
-          print(f"Chat ID present: {bool(chat_id)}")
           msg = (
               "✅ NSE Pro Scanner is LIVE!\n\n"
               "Your Telegram alerts are working perfectly.\n"
-              "Scanner will run automatically at:\n"
+              "Scanner runs automatically at:\n"
               "📅 9:20 AM IST — Morning scan\n"
               "📅 3:00 PM IST — Pre-close scan\n\n"
-              "Every market day. No action needed from you! 🚀"
+              "Every market day. No action needed! 🚀"
           )
           r = requests.post(
               f"https://api.telegram.org/bot{token}/sendMessage",
@@ -80,17 +78,23 @@ jobs:
               timeout=10
           )
           print("Status:", r.status_code)
-          print("Response:", r.json())
           if r.status_code == 200:
-              print("✅ Telegram message sent successfully!")
+              print("✅ Telegram OK!")
           else:
-              print("❌ Failed to send message")
+              print("❌ Failed:", r.text)
               exit(1)
           PYEOF
 
       - name: Run scanner
         if: ${{ github.event.inputs.mode != 'telegram_test' }}
-        run: python scanner.py ${{ github.event.inputs.mode || 'scan' }} ${{ github.event.inputs.symbol || '' }}
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          SYMBOL="${{ github.event.inputs.symbol }}"
+          # For scheduled runs, always do full scan
+          if [ -z "$MODE" ]; then
+            MODE="scan"
+          fi
+          python scanner.py $MODE $SYMBOL
 
       - name: Upload log
         uses: actions/upload-artifact@v4
