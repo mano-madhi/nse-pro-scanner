@@ -928,6 +928,8 @@ def entry_score(df: pd.DataFrame, sr: dict, fd: dict) -> tuple[bool, int, list, 
         score += 2; card.append(f"RSI {rsi:.0f} ✅ — ideal buy zone (35–55)")
     elif 55 < rsi <= 65:
         score += 1; card.append(f"RSI {rsi:.0f} — acceptable (55–65)")
+    elif 65 < rsi <= 70:
+        card.append(f"⚠️ RSI {rsi:.0f} — slightly extended")
     elif rsi > 70:
         return False, 0, [], {}   # overbought — hard reject
     elif rsi < 30:
@@ -1108,6 +1110,7 @@ def build_signal(symbol: str, sector: str,
     # ── Total score ───────────────────────────────────────────────────────────
     total = f_score + t_score + e_score
 
+    # Minimum threshold
     if total < 13:
         return None
 
