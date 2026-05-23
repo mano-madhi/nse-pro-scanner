@@ -16,6 +16,7 @@ on:
           - telegram_test
           - test
           - fundamentals
+          - setup_sheets
       symbol:
         description: "Stock symbol (for test mode only)"
         required: false
@@ -90,11 +91,14 @@ jobs:
         run: |
           MODE="${{ github.event.inputs.mode }}"
           SYMBOL="${{ github.event.inputs.symbol }}"
-          # For scheduled runs, always do full scan
           if [ -z "$MODE" ]; then
             MODE="scan"
           fi
-          python scanner.py $MODE $SYMBOL
+          if [ "$MODE" = "setup_sheets" ]; then
+            python setup_sheets.py
+          else
+            python scanner.py $MODE $SYMBOL
+          fi
 
       - name: Upload log
         uses: actions/upload-artifact@v4
