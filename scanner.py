@@ -1074,19 +1074,28 @@ def build_signal(symbol: str, sector: str,
     buy_low  = round(close * 0.998, 2)
     buy_high = round(close * 1.003, 2)
 
-    # ── Stop Loss — below support if near one, else 1.5×ATR ──────────────────
+    # ── Stop Loss — smarter calculation ──────────────────────────────────────
     near_sup = entry_data.get("near_support")
+
     if near_sup and near_sup["level"] < close:
-        sl = round(near_sup["level"] * 0.985, 2)   # 1.5% below support
-        sl_type = f"below support ₹{near_sup['level']}"
+        # Use support zone SL — most precise
+        gap_to_support = (close - near_sup["level"]) / close * 100
+        if gap_to_support <= 5:
+            sl = round(near_sup["level"] * 0.988, 2)   # 1.2% below support
+            sl_type = f"below support ₹{near_sup['level']} ({near_sup.get('bounces',1)}× bounce)"
+        else:
+            # Support too far — use ATR
+            sl = round(close - 1.0 * atr, 2)
+            sl_type = "ATR-based (1×ATR)"
     else:
-        sl = round(close - 1.5 * atr, 2)
-        sl_type = "ATR-based"
+        # No nearby support — use tighter ATR
+        sl = round(close - 1.0 * atr, 2)
+        sl_type = "ATR-based (1×ATR)"
 
     sl_pct = round((close - sl) / close * 100, 1)
 
     # Hard reject if SL too tight or too wide
-    if sl_pct < 1.0 or sl_pct > 9.0:
+    if sl_pct < 1.0 or sl_pct > 8.0:
         return None
 
     # ── Targets (your 10% goal is T2) ────────────────────────────────────────
@@ -1099,13 +1108,12 @@ def build_signal(symbol: str, sector: str,
     if near_res:
         res_pct = (near_res["level"] - close) / close * 100
         if res_pct < 8:
-            # Adjust T1 to just below resistance, warn about T2
             t1 = round(min(t1, near_res["level"] * 0.995), 2)
 
     rr = round((t2 - close) / (close - sl), 1)
 
-    if rr < 1.5:
-        return None   # poor RR
+    if rr < 1.2:
+        return None   # poor RR — minimum 1.2
 
     # ── Total score ───────────────────────────────────────────────────────────
     total = f_score + t_score + e_score
