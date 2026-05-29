@@ -1,9 +1,9 @@
 name: NSE Pro Scanner
 
 on:
-  schedule:
-    - cron: "50 3 * * 1-5"    # 09:20 AM IST (Mon-Fri)
-    - cron: "30 9 * * 1-5"    # 03:00 PM IST (Mon-Fri)
+ # schedule:
+  #  - cron: "50 3 * * 1-5"    # 09:20 AM IST (Mon-Fri)
+  #  - cron: "30 9 * * 1-5"    # 03:00 PM IST (Mon-Fri)
   workflow_dispatch:
     inputs:
       mode:
