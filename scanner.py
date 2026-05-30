@@ -1250,6 +1250,10 @@ def fmt_buy_alert(sig: dict) -> str:
     if sig["buyers_coming"]: vol_line += "\n   📈 Buying volume rising ✅"
     obv_line = "\n   OBV: Smart money accumulating ✅" if sig["obv_positive"] else ""
 
+    rsi_s   = f"{sig['rsi']:.0f}"   if sig.get("rsi")     else "N/A"
+    stoch_s = f"{sig['stoch_k']:.0f}" if sig.get("stoch_k") else "N/A"
+    macd_s  = "✅ Bullish cross" if sig.get("macd_cross") else "✅ Positive"
+
     return (
         f"{sig['conv_emoji']} <b>{sig['conviction']} — {sig['symbol']}</b>\n"
         f"<i>{sig['sector']}  ·  Hold: {sig['timeframe']}</i>\n"
@@ -1269,8 +1273,7 @@ def fmt_buy_alert(sig: dict) -> str:
         f"   Piotroski: {pio_s}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📈 <b>Technicals</b>  (Trend {sig['t_score']}/8  ·  Entry {sig['e_score']}/10)\n"
-        f"   RSI: {sig['rsi']:.0f}  ·  MACD: {'✅ Bullish cross' if sig['macd_cross'] else '✅ Positive'}"
-        f"  ·  Stoch: {sig['stoch_k']:.0f if sig['stoch_k'] else 'N/A'}\n"
+        f"   RSI: {rsi_s}  ·  MACD: {macd_s}  ·  Stoch: {stoch_s}\n"
         f"   52W High: ₹{sig['high52']}  ·  Dip from High: {sig['dip_pct']}%"
         f"{sup_line}{res_line}{vol_line}{obv_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
