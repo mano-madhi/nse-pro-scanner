@@ -114,7 +114,7 @@ UNIVERSE = {
     "Infrastructure & Capital Goods": [
         "LT","SIEMENS","ABB","HAVELLS","POLYCAB","VOLTAS","BHEL",
         "THERMAX","CUMMINSIND","GRINDWELL","SCHAEFFLER","SKFINDIA",
-        "HAL","BEL","COCHINSHIP","MAZAGON",
+        "HAL","BEL","COCHINSHIP","MAZDOCK",
     ],
     "Metals & Mining": [
         "TATASTEEL","JSWSTEEL","HINDALCO","SAIL","VEDL","NMDC","COALINDIA",
@@ -122,7 +122,7 @@ UNIVERSE = {
     ],
     "Cement & Building": [
         "ULTRACEMCO","SHREECEM","AMBUJACEM","ACC","JKCEMENT","RAMCOCEM",
-        "DALMIA","HEIDELBERG",
+        "DALBHARAT","HEIDELBERG",
     ],
     "Chemicals & Specialty": [
         "SRF","DEEPAKNITRITE","TATACHEM","GNFC","ATUL","NAVINFLUOR",
@@ -1234,65 +1234,94 @@ def _fmt(v, unit="", na="N/A") -> str:
 
 
 def fmt_buy_alert(sig: dict) -> str:
-    roe_s  = _fmt(f"{sig['roe']:.1f}"  if sig.get("roe")  else None, "%")
-    roce_s = _fmt(f"{sig['roce']:.1f}" if sig.get("roce") else None, "%")
-    de_s   = _fmt(f"{sig['de']:.2f}"   if sig.get("de")   else None)
-    nm_s   = _fmt(f"{sig['net_margin']:.1f}" if sig.get("net_margin") else None, "%")
-    epsg_s = _fmt(f"{sig['eps_growth']:+.1f}" if sig.get("eps_growth") else None, "%")
-    revg_s = _fmt(f"{sig['rev_growth']:+.1f}" if sig.get("rev_growth") else None, "%")
-    fcf_s  = f"₹{sig['fcf']:.0f} Cr" if sig.get("fcf") else "N/A"
-    pro_s  = _fmt(f"{sig['promoter']:.1f}" if sig.get("promoter") else None, "%")
-    plg_s  = _fmt(f"{sig['pledging']:.1f}" if sig.get("pledging") is not None else None, "%")
-    pio_s  = _fmt(sig.get("piotroski"), "/9")
-    pe_s   = _fmt(f"{sig['pe']:.1f}"       if sig.get("pe") else None, "×")
-    mc_s   = f"₹{sig['market_cap']:,.0f} Cr" if sig.get("market_cap") else "N/A"
+    """Clean, well-aligned Telegram BUY signal alert."""
 
-    # Support / Resistance lines
-    sup_line = ""
-    if sig["near_support"]:
-        sup_line = (f"\n   Support: ₹{sig['near_support']} "
-                    f"({sig['sup_bounces']}× tested) ✅")
-    res_line = ""
-    if sig["near_res"]:
-        res_pct = round((sig["near_res"] - sig["close"]) / sig["close"] * 100, 1)
-        res_line = f"\n   Resistance: ₹{sig['near_res']} ({res_pct:+.1f}% away)"
+    # ── Data preparation ──────────────────────────────────────────────────────
+    roe_s  = f"{sig['roe']:.1f}%"    if sig.get("roe")        else "—"
+    roce_s = f"{sig['roce']:.1f}%"   if sig.get("roce")       else "—"
+    de_s   = f"{sig['de']:.2f}"      if sig.get("de")         else "—"
+    nm_s   = f"{sig['net_margin']:.1f}%" if sig.get("net_margin") else "—"
+    revg_s = f"{sig['rev_growth']:+.1f}%" if sig.get("rev_growth") else "—"
+    epsg_s = f"{sig['eps_growth']:+.1f}%" if sig.get("eps_growth") else "—"
+    pe_s   = f"{sig['pe']:.1f}×"     if sig.get("pe")         else "—"
+    pio_s  = f"{sig['piotroski']}/9" if sig.get("piotroski")  else "—"
+    rsi_s  = f"{sig['rsi']:.0f}"     if sig.get("rsi")        else "—"
+    stoch_s= f"{sig['stoch_k']:.0f}" if sig.get("stoch_k")    else "—"
+    macd_s = "✅ Crossover" if sig.get("macd_cross") else "✅ Positive"
 
-    # Volume lines
-    vol_line = ""
-    if sig["vol_drying"]:   vol_line += "\n   📉 Selling volume drying ✅"
-    if sig["buyers_coming"]: vol_line += "\n   📈 Buying volume rising ✅"
-    obv_line = "\n   OBV: Smart money accumulating ✅" if sig["obv_positive"] else ""
+    # Volume signals
+    vol_signals = []
+    if sig.get("vol_drying"):    vol_signals.append("Selling drying ✅")
+    if sig.get("buyers_coming"): vol_signals.append("Buyers rising ✅")
+    if sig.get("obv_positive"):  vol_signals.append("Smart money in ✅")
+    vol_s = "  ·  ".join(vol_signals) if vol_signals else "Neutral"
 
-    rsi_s   = f"{sig['rsi']:.0f}"   if sig.get("rsi")     else "N/A"
-    stoch_s = f"{sig['stoch_k']:.0f}" if sig.get("stoch_k") else "N/A"
-    macd_s  = "✅ Bullish cross" if sig.get("macd_cross") else "✅ Positive"
+    # Support / Resistance
+    sup_s = f"₹{sig['near_support']} ({sig['sup_bounces']}× bounce) ✅" if sig.get("near_support") else "No nearby zone"
+    res_s = f"₹{sig['near_res']} ({round((sig['near_res']-sig['close'])/sig['close']*100,1):+.1f}%)" if sig.get("near_res") else "Clear path"
+
+    # Screener.in quick check link
+    screener_url = f"https://www.screener.in/company/{sig['symbol']}/"
+
+    # Profit amounts (for ₹1 lakh investment as example)
+    invest = 100000
+    qty    = int(invest / sig["buy_high"])
+    sl_loss   = round(qty * (sig["buy_high"] - sig["sl"]), 0)
+    t1_profit = round(qty * (sig["t1"] - sig["buy_high"]), 0)
+    t2_profit = round(qty * (sig["t2"] - sig["buy_high"]), 0)
 
     return (
-        f"{sig['conv_emoji']} <b>{sig['conviction']} — {sig['symbol']}</b>\n"
-        f"<i>{sig['sector']}  ·  Hold: {sig['timeframe']}</i>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 <b>Buy Zone:</b>  ₹{sig['buy_low']} – ₹{sig['buy_high']}\n"
-        f"🛑 <b>Stop Loss:</b> ₹{sig['sl']}  <i>(−{sig['sl_pct']}%  ·  {sig['sl_type']})</i>\n"
-        f"🎯 <b>T1  (+5%):</b>  ₹{sig['t1']}  — Book 30–40%\n"
-        f"🎯 <b>T2 (+10%):</b>  ₹{sig['t2']}  — <b>Your Main Target</b>\n"
-        f"🎯 <b>T3 (+15%):</b>  ₹{sig['t3']}  — Trail SL if momentum continues\n"
-        f"📐 <b>Risk : Reward = 1 : {sig['rr_ratio']}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏢 <b>Fundamentals</b>  (Score {sig['f_score']}/12)\n"
-        f"   ROE: {roe_s}  ·  ROCE: {roce_s}  ·  Net Margin: {nm_s}\n"
-        f"   D/E: {de_s}  ·  P/E: {pe_s}  ·  Market Cap: {mc_s}\n"
-        f"   EPS Growth: {epsg_s}  ·  Rev Growth: {revg_s}\n"
-        f"   FCF: {fcf_s}  ·  Promoter: {pro_s}  ·  Pledging: {plg_s}\n"
-        f"   Piotroski: {pio_s}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 <b>Technicals</b>  (Trend {sig['t_score']}/8  ·  Entry {sig['e_score']}/10)\n"
-        f"   RSI: {rsi_s}  ·  MACD: {macd_s}  ·  Stoch: {stoch_s}\n"
-        f"   52W High: ₹{sig['high52']}  ·  Dip from High: {sig['dip_pct']}%"
-        f"{sup_line}{res_line}{vol_line}{obv_line}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏆 <b>Total Score: {sig['total_score']}/30</b>\n"
-        f"⚠️ <i>Always honor SL. Strong companies recover — but protect capital first.</i>\n"
-        f"🕐 {sig['scan_time']}"
+        f"{sig['conv_emoji']} <b>{sig['conviction']}</b>\n"
+        f"<b>📌 {sig['symbol']}</b>  |  {sig['sector']}\n"
+        f"⏱ Hold: {sig['timeframe']}  ·  Score: {sig['total_score']}/30\n"
+        f"\n"
+        f"{'─'*28}\n"
+        f"💰 <b>BUY ZONE</b>\n"
+        f"   Entry  :  ₹{sig['buy_low']} – ₹{sig['buy_high']}\n"
+        f"   SL     :  ₹{sig['sl']}  (−{sig['sl_pct']}%)\n"
+        f"\n"
+        f"🎯 <b>TARGETS</b>\n"
+        f"   T1 +5%  :  ₹{sig['t1']}  → Book 30-40% here\n"
+        f"   T2 +10% :  ₹{sig['t2']}  → <b>Main target</b>\n"
+        f"   T3 +15% :  ₹{sig['t3']}  → Trail SL\n"
+        f"   RR Ratio:  1 : {sig['rr_ratio']}\n"
+        f"\n"
+        f"💵 <b>On ₹1L investment (~{qty} shares)</b>\n"
+        f"   Risk (SL hit)  : −₹{sl_loss:,.0f}\n"
+        f"   T1 profit      : +₹{t1_profit:,.0f}\n"
+        f"   T2 profit      : +₹{t2_profit:,.0f}\n"
+        f"\n"
+        f"{'─'*28}\n"
+        f"🏢 <b>FUNDAMENTALS</b>  ({sig['f_score']}/12)\n"
+        f"   ROE        :  {roe_s}\n"
+        f"   ROCE       :  {roce_s}\n"
+        f"   D/E        :  {de_s}\n"
+        f"   Net Margin :  {nm_s}\n"
+        f"   Rev Growth :  {revg_s}\n"
+        f"   EPS Growth :  {epsg_s}\n"
+        f"   P/E        :  {pe_s}\n"
+        f"   Piotroski  :  {pio_s}\n"
+        f"\n"
+        f"{'─'*28}\n"
+        f"📈 <b>TECHNICALS</b>  (T:{sig['t_score']}/8  E:{sig['e_score']}/10)\n"
+        f"   RSI        :  {rsi_s}  (ideal: 35–55)\n"
+        f"   MACD       :  {macd_s}\n"
+        f"   Stoch RSI  :  {stoch_s}\n"
+        f"   Dip        :  {sig['dip_pct']}% from 52W High ₹{sig['high52']}\n"
+        f"   EMA Trend  :  {'✅ Above EMA200' if sig.get('above_ema200') else '⚠️ Near EMA200'}\n"
+        f"   Support    :  {sup_s}\n"
+        f"   Resistance :  {res_s}\n"
+        f"   Volume     :  {vol_s}\n"
+        f"\n"
+        f"{'─'*28}\n"
+        f"🔍 <b>VERIFY BEFORE ENTRY</b>\n"
+        f"   <a href='{screener_url}'>📊 Check on Screener.in</a>\n"
+        f"   ✔ Promoter pledging &lt;15%?\n"
+        f"   ✔ Last 3 quarters profitable?\n"
+        f"   ✔ No recent bad news?\n"
+        f"\n"
+        f"🕐 {sig['scan_time']}\n"
+        f"⚠️ <i>Paper trade first. Always set SL.</i>"
     )
 
 
@@ -1307,12 +1336,13 @@ def fmt_summary(signals: list, label: str) -> str:
         )
     lines = [
         f"📡 <b>Pro Scan — {label}</b>  |  {now}\n",
-        f"✅ <b>{len(signals)} actionable signal(s) — GOOD BUY or above:</b>\n",
+        f"✅ <b>{len(signals)} signal(s) — Score 22+ only:</b>\n",
     ]
-    for s in signals[:15]:   # max 15 in summary to avoid Telegram length limit
+    for s in signals[:15]:
         lines.append(
             f"{s['conv_emoji']} <b>{s['symbol']}</b> ({s['sector'][:10]}) "
-            f"| Buy ₹{s['buy_low']} | SL ₹{s['sl']} | T2 ₹{s['t2']} "
+            f"| Buy ₹{s['buy_low']} | SL ₹{s['sl']} "
+            f"| T1 ₹{s['t1']} | T2 ₹{s['t2']} "
             f"| Score <b>{s['total_score']}/30</b>"
         )
     if len(signals) > 15:
