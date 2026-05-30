@@ -76,7 +76,7 @@ SCREENER_HEADERS = {
 UNIVERSE = {
     "Banking & Finance": [
         "HDFCBANK","ICICIBANK","KOTAKBANK","AXISBANK","SBIN","INDUSINDBK",
-        "BANDHANBNK","FEDERALBNK","IDFCFIRSTB","PNB","BANKBARODA","CANARABANK",
+        "BANDHANBNK","FEDERALBNK","IDFCFIRSTB","PNB","BANKBARODA","CANBK",
         "BAJFINANCE","BAJAJFINSV","CHOLAFIN","MUTHOOTFIN","MANAPPURAM",
         "SBILIFE","HDFCLIFE","ICICIGI","ICICIPRULI","LICI","MFSL",
         "PNBHOUSING","LICHSGFIN","RECLTD","PFC","IRFC",
@@ -97,7 +97,7 @@ UNIVERSE = {
     ],
     "Automobile": [
         "MARUTI","M&M","TATAMOTORS","BAJAJ-AUTO","EICHERMOT","HEROMOTOCO",
-        "TVSMOTORS","ASHOKLEY","BHARATFORG","MOTHERSON","BOSCHLTD",
+        "TVSMOTOR","ASHOKLEY","BHARATFORG","MOTHERSON","BOSCHLTD",
         "ENDURANCE","BALKRISIND","APOLLOTYRE","MRF","CEATLTD",
     ],
     "Pharma & Healthcare": [
@@ -113,7 +113,7 @@ UNIVERSE = {
     ],
     "Infrastructure & Capital Goods": [
         "LT","SIEMENS","ABB","HAVELLS","POLYCAB","VOLTAS","BHEL",
-        "THERMAX","CUMMINSIND","GRINDWELL","SCHAEFFLER","SKF",
+        "THERMAX","CUMMINSIND","GRINDWELL","SCHAEFFLER","SKFINDIA",
         "HAL","BEL","COCHINSHIP","MAZAGON",
     ],
     "Metals & Mining": [
@@ -137,7 +137,7 @@ UNIVERSE = {
     ],
     "Consumption & Internet": [
         "PAGEIND","DIXON","AMBER","VGUARD","CROMPTON",
-        "FINOLEX","NAUKRI","INDIAMART",
+        "FINPIPE","NAUKRI","INDIAMART",
     ],
 }
 
@@ -621,18 +621,28 @@ def fundamental_score(sym: str, sector: str, fd: dict) -> tuple[bool, str, int, 
 # ════════════════════════════════════════════════════════════════════════════
 
 def fetch_ohlcv(symbol: str, period="1y", interval="1d") -> pd.DataFrame | None:
-    try:
-        df = yf.download(nse(symbol), period=period, interval=interval,
-                         auto_adjust=True, progress=False)
-        if df.empty or len(df) < 120:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.index = pd.to_datetime(df.index)
-        return df
-    except Exception as e:
-        log.warning(f"OHLCV fail {symbol}: {e}")
-        return None
+    """Fetch OHLCV with retry for temporary Yahoo Finance failures."""
+    for attempt in range(3):
+        try:
+            df = yf.download(nse(symbol), period=period, interval=interval,
+                             auto_adjust=True, progress=False)
+            if df.empty or len(df) < 120:
+                if attempt < 2:
+                    time.sleep(2)
+                    continue
+                return None
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df.index = pd.to_datetime(df.index)
+            return df
+        except Exception as e:
+            if attempt < 2:
+                log.warning(f"OHLCV attempt {attempt+1} failed {symbol}: {e}. Retrying...")
+                time.sleep(2)
+            else:
+                log.warning(f"OHLCV failed after 3 attempts for {symbol}: {e}")
+                return None
+    return None
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
