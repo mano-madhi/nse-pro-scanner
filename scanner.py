@@ -505,8 +505,8 @@ IS_BANK = {"Banking & Finance"}
 
 def fundamental_score(sym: str, sector: str, fd: dict) -> tuple[bool, str, int, list]:
     """
-    Returns (passes, fail_reason, score, scorecard_lines).
-    Only hard-rejects on data we actually have — missing data = skip that check.
+    STRONG fundamental filter — institutional grade.
+    Minimum score raised to 6/12. Hard rejects are strict.
     """
     if not fd:
         return False, "No fundamental data available", 0, []
@@ -515,103 +515,122 @@ def fundamental_score(sym: str, sector: str, fd: dict) -> tuple[bool, str, int, 
     score   = 0
     card    = []
 
-    # ── HARD REJECTS — only when data is present and clearly bad ─────────────
+    # ── HARD REJECTS ──────────────────────────────────────────────────────────
 
-    # 1. Promoter Pledging > 25%
+    # 1. Promoter Pledging > 20%
     pledging = fd.get("promoter_pledging")
-    if pledging is not None and pledging > 25:
-        return False, f"Promoter pledging {pledging:.1f}% (>25%)", 0, []
+    if pledging is not None and pledging > 20:
+        return False, f"Promoter pledging {pledging:.1f}% (>20%)", 0, []
 
-    # 2. Revenue clearly declining
+    # 2. Revenue declining > 5%
     rev_g = fd.get("rev_growth_pct")
-    if rev_g is not None and rev_g < -10:
-        return False, f"Revenue falling sharply ({rev_g:.1f}%)", 0, []
+    if rev_g is not None and rev_g < -5:
+        return False, f"Revenue declining ({rev_g:.1f}%) — business shrinking", 0, []
 
-    # 3. Clearly loss-making
+    # 3. Loss-making company
     nm = fd.get("net_margin_latest")
-    if nm is not None and nm < -5:
+    if nm is not None and nm < 0:
         return False, f"Company loss-making (margin {nm:.1f}%)", 0, []
 
-    # 4. Interest coverage dangerously low
-    ic = fd.get("interest_coverage")
-    if ic is not None and ic < 1.0 and not is_bank:
-        return False, f"Interest coverage {ic:.1f}× (critical)", 0, []
-
-    # ── SCORING — only score what we have data for ────────────────────────────
-
-    # ROE
+    # 4. Negative ROE
     roe = fd.get("roe")
-    if roe is not None:
-        if roe >= 15:   score += 2; card.append(f"ROE {roe:.1f}% ★★")
-        elif roe >= 8:  score += 1; card.append(f"ROE {roe:.1f}% ★")
-        elif roe < 0:   return False, f"ROE negative ({roe:.1f}%)", 0, []
-    else:
-        card.append("ROE: data pending")
-        score += 1  # give benefit of doubt for large NSE stocks
+    if roe is not None and roe < 0:
+        return False, f"ROE negative ({roe:.1f}%) — destroying value", 0, []
 
-    # ROCE
+    # 5. ROE too weak (non-bank)
+    if roe is not None and roe < 8 and not is_bank:
+        return False, f"ROE {roe:.1f}% too low (<8%)", 0, []
+
+    # 6. Interest coverage critical
+    ic = fd.get("interest_coverage")
+    if ic is not None and ic < 1.5 and not is_bank:
+        return False, f"Interest coverage {ic:.1f}× — cannot pay interest", 0, []
+
+    # 7. Piotroski too weak
+    pio = fd.get("piotroski", 5)
+    if pio <= 2:
+        return False, f"Piotroski {pio}/9 — company fundamentally weakening", 0, []
+
+    # ── SCORING ───────────────────────────────────────────────────────────────
+
+    # ROE (max 2)
+    if roe is not None:
+        if roe >= 20:   score += 2; card.append(f"ROE {roe:.1f}% ★★")
+        elif roe >= 12: score += 1; card.append(f"ROE {roe:.1f}% ★")
+        else:           card.append(f"ROE {roe:.1f}%")
+    else:
+        card.append("ROE: unavailable")   # NO bonus for missing data
+
+    # ROCE (max 2)
     roce = fd.get("roce")
     if roce is not None:
-        if roce >= 15:  score += 2; card.append(f"ROCE {roce:.1f}% ★★")
-        elif roce >= 8: score += 1; card.append(f"ROCE {roce:.1f}% ★")
+        if roce >= 20:   score += 2; card.append(f"ROCE {roce:.1f}% ★★")
+        elif roce >= 12: score += 1; card.append(f"ROCE {roce:.1f}% ★")
     else:
-        score += 1; card.append("ROCE: data pending")
+        card.append("ROCE: unavailable")  # NO bonus for missing data
 
-    # Net Margin
+    # Net Margin (max 1)
     if nm is not None:
-        if nm >= 12:    score += 1; card.append(f"Net Margin {nm:.1f}% ★")
-        elif nm >= 5:   card.append(f"Net Margin {nm:.1f}%")
+        if nm >= 15:   score += 1; card.append(f"Net Margin {nm:.1f}% ★")
+        elif nm >= 8:  card.append(f"Net Margin {nm:.1f}%")
+        elif nm >= 0:  card.append(f"Net Margin {nm:.1f}% (thin)")
     else:
-        card.append("Margin: data pending")
+        card.append("Net Margin: unavailable")  # NO bonus
 
-    # Debt/Equity
+    # Debt/Equity (max 2)
     de = fd.get("de")
     if de is not None:
-        max_de = 10.0 if is_bank else 1.5
-        if de <= (5.0 if is_bank else 0.5):
-            score += 2; card.append(f"D/E {de:.2f} ★★ (low debt)")
-        elif de <= max_de:
+        if de <= (3.0 if is_bank else 0.3):
+            score += 2; card.append(f"D/E {de:.2f} ★★ (very low debt)")
+        elif de <= (10.0 if is_bank else 1.0):
             score += 1; card.append(f"D/E {de:.2f} ★")
         else:
             card.append(f"⚠️ D/E {de:.2f} (high)")
     else:
-        score += 1; card.append("D/E: data pending")
+        card.append("D/E: unavailable")  # NO bonus
 
-    # Revenue Growth
+    # Revenue Growth (max 2)
     if rev_g is not None:
-        if rev_g >= 10:  score += 2; card.append(f"Rev Growth {rev_g:.1f}% ★★")
-        elif rev_g >= 0: score += 1; card.append(f"Rev Growth {rev_g:.1f}% ★")
-        else:            card.append(f"⚠️ Rev Growth {rev_g:.1f}%")
+        if rev_g >= 15:  score += 2; card.append(f"Rev Growth {rev_g:.1f}% ★★")
+        elif rev_g >= 5: score += 1; card.append(f"Rev Growth {rev_g:.1f}% ★")
+        elif rev_g >= 0: card.append(f"Rev Growth {rev_g:.1f}% (flat)")
     else:
-        score += 1; card.append("Rev Growth: data pending")
+        card.append("Rev Growth: unavailable")  # NO bonus
 
-    # EPS Growth
+    # EPS Growth (max 1)
     eps_g = fd.get("eps_growth_yoy")
     if eps_g is not None:
-        if eps_g >= 10:  score += 1; card.append(f"EPS Growth {eps_g:.1f}% ★")
+        if eps_g >= 15:  score += 1; card.append(f"EPS Growth {eps_g:.1f}% ★")
         elif eps_g >= 0: card.append(f"EPS Growth {eps_g:.1f}%")
-        else:            card.append(f"⚠️ EPS {eps_g:.1f}%")
+        else:            card.append(f"⚠️ EPS falling {eps_g:.1f}%")
     else:
-        card.append("EPS Growth: data pending")
+        card.append("EPS Growth: unavailable")  # NO bonus
 
-    # FCF
+    # FCF (max 1)
     fcf = fd.get("fcf")
     if fcf is not None:
         if fcf > 0: score += 1; card.append(f"FCF ₹{fcf:.0f}Cr ★")
         else:       card.append(f"⚠️ FCF negative")
     else:
-        card.append("FCF: data pending")
+        card.append("FCF: unavailable")  # NO bonus
 
-    # Market cap — large cap gets bonus
+    # Market cap (max 1)
     mcap = fd.get("market_cap_cr") or 0
-    if mcap >= 10000:
+    if mcap >= 20000:
         score += 1; card.append(f"Large cap ₹{mcap:,.0f}Cr ★")
-    elif mcap >= 2000:
+    elif mcap >= 5000:
         card.append(f"Mid cap ₹{mcap:,.0f}Cr")
+    else:
+        card.append(f"Small cap ₹{mcap:,.0f}Cr")
 
-    # Minimum score — lower threshold since some data may be missing
-    if score < 3:
-        return False, f"Fundamental score {score}/12 too low", 0, []
+    # Piotroski (max 1)
+    if pio >= 7:   score += 1; card.append(f"Piotroski {pio}/9 ★★")
+    elif pio >= 5: card.append(f"Piotroski {pio}/9")
+    else:          card.append(f"⚠️ Piotroski {pio}/9 (weak)")
+
+    # ── Minimum: 5/12 from REAL data (no missing data bonuses anymore) ─────────
+    if score < 5:
+        return False, f"Fundamental score {score}/12 too low — real data insufficient", 0, []
 
     return True, "", score, card
 
@@ -1088,32 +1107,26 @@ def build_signal(symbol: str, sector: str,
     near_sup = entry_data.get("near_support")
 
     if near_sup and near_sup["level"] < close:
-        # Use support zone SL — most precise
         gap_to_support = (close - near_sup["level"]) / close * 100
         if gap_to_support <= 5:
-            sl = round(near_sup["level"] * 0.988, 2)   # 1.2% below support
+            sl = round(near_sup["level"] * 0.988, 2)
             sl_type = f"below support ₹{near_sup['level']} ({near_sup.get('bounces',1)}× bounce)"
         else:
-            # Support too far — use ATR
-            sl = round(close - 1.0 * atr, 2)
-            sl_type = "ATR-based (1×ATR)"
+            sl = round(close - 1.2 * atr, 2)
+            sl_type = "ATR-based (1.2×ATR)"
     else:
-        # No nearby support — use tighter ATR
-        sl = round(close - 1.0 * atr, 2)
-        sl_type = "ATR-based (1×ATR)"
+        sl = round(close - 1.2 * atr, 2)
+        sl_type = "ATR-based (1.2×ATR)"
 
     sl_pct = round((close - sl) / close * 100, 1)
 
-    # Hard reject if SL too tight or too wide
     if sl_pct < 1.0 or sl_pct > 8.0:
         return None
 
-    # ── Targets (your 10% goal is T2) ────────────────────────────────────────
-    t1 = round(close * 1.05,  2)    # 5%  — partial booking
-    t2 = round(close * 1.10,  2)    # 10% — main goal
-    t3 = round(close * 1.15,  2)    # 15% — trail and let run
+    t1 = round(close * 1.05,  2)
+    t2 = round(close * 1.10,  2)
+    t3 = round(close * 1.15,  2)
 
-    # Check resistance doesn't block T2
     near_res = entry_data.get("near_resistance")
     if near_res:
         res_pct = (near_res["level"] - close) / close * 100
@@ -1122,8 +1135,8 @@ def build_signal(symbol: str, sector: str,
 
     rr = round((t2 - close) / (close - sl), 1)
 
-    if rr < 1.2:
-        return None   # poor RR — minimum 1.2
+    if rr < 1.5:
+        return None   # must have at least 1.5 RR
 
     # ── Total score ───────────────────────────────────────────────────────────
     total = f_score + t_score + e_score
@@ -1294,15 +1307,17 @@ def fmt_summary(signals: list, label: str) -> str:
         )
     lines = [
         f"📡 <b>Pro Scan — {label}</b>  |  {now}\n",
-        f"✅ <b>{len(signals)} high-quality signal(s):</b>\n",
+        f"✅ <b>{len(signals)} actionable signal(s) — GOOD BUY or above:</b>\n",
     ]
-    for s in signals:
+    for s in signals[:15]:   # max 15 in summary to avoid Telegram length limit
         lines.append(
             f"{s['conv_emoji']} <b>{s['symbol']}</b> ({s['sector'][:10]}) "
             f"| Buy ₹{s['buy_low']} | SL ₹{s['sl']} | T2 ₹{s['t2']} "
             f"| Score <b>{s['total_score']}/30</b>"
         )
-    lines.append("\n<i>Full details sent in individual alerts above.</i>")
+    if len(signals) > 15:
+        lines.append(f"\n<i>...and {len(signals)-15} more. Check Google Sheets for full list.</i>")
+    lines.append("\n<i>Detailed alert sent for each signal above.</i>")
     return "\n".join(lines)
 
 
@@ -1495,11 +1510,17 @@ def run_scan(label="Morning Scan"):
         log.info(f"[{i+1:3}/{len(ALL_STOCKS)}] {symbol:15} ({sector[:20]})")
 
         try:
-            # ── Tier 1: Fundamentals (yfinance) ──────────────────────────────
+            # ── Tier 1: Fundamentals ──────────────────────────────────────────
             fd = fetch_fundamentals(symbol)
             passes, reason, f_score, f_card = fundamental_score(symbol, sector, fd)
             if not passes:
                 log.info(f"         ✗ Fundamental: {reason}")
+                f_fail += 1
+                continue
+
+            # Minimum Tier 1 score: 6/12
+            if f_score < 6:
+                log.info(f"         ✗ Fundamental score {f_score}/12 below minimum (6)")
                 f_fail += 1
                 continue
             log.info(f"         ✓ Fundamental score {f_score}/12")
@@ -1516,13 +1537,34 @@ def run_scan(label="Morning Scan"):
                 log.info(f"         ✗ Trend: price too far below EMA200")
                 t_fail += 1
                 continue
+
+            # Minimum Tier 2 score: 3/8 — ensures at least basic trend alignment
+            if t_score < 3:
+                log.info(f"         ✗ Trend score {t_score}/8 too weak (min 3) — not in buy zone")
+                t_fail += 1
+                continue
             log.info(f"         ✓ Trend score {t_score}/8")
+
+            # ── Dip check — must be at least 5% from 52W high ─────────────────
+            close  = float(df["Close"].iloc[-1])
+            high52 = float(df["High"].tail(252).max())
+            dip    = (high52 - close) / high52 * 100
+            if dip < 5:
+                log.info(f"         ✗ Dip only {dip:.1f}% — not a meaningful entry (min 5%)")
+                t_fail += 1
+                continue
 
             # ── Tier 3: Entry Timing ──────────────────────────────────────────
             sr = find_sr_zones(df)
             e_passes, e_score, e_card, entry_data = entry_score(df, sr, fd)
             if not e_passes:
                 log.info(f"         ✗ Entry: RSI overbought or insufficient setup")
+                e_fail += 1
+                continue
+
+            # Minimum Tier 3 score: 4/10 — ensures proper entry timing
+            if e_score < 4:
+                log.info(f"         ✗ Entry score {e_score}/10 too weak (min 4) — timing not right")
                 e_fail += 1
                 continue
             log.info(f"         ✓ Entry score {e_score}/10")
@@ -1540,11 +1582,19 @@ def run_scan(label="Morning Scan"):
                 f"Dip {sig['dip_pct']}% | RSI {sig['rsi']:.0f}"
             )
 
-            # Send Telegram alert immediately
-            _tg(fmt_buy_alert(sig))
+            # Always log to Google Sheets
             log_to_sheets(sig)
             signals.append(sig)
-            time.sleep(0.5)
+
+            # ── Telegram only for GOOD BUY ★★ (22+) and STRONG BUY ★★★ (26+) ──
+            # Score 22+ means all 3 tiers are genuinely strong
+            # WATCHLIST (below 22) → Sheets only, no Telegram noise
+            if sig["total_score"] >= 22:
+                _tg(fmt_buy_alert(sig))
+                log.info(f"         📲 Telegram alert sent!")
+                time.sleep(0.5)
+            else:
+                log.info(f"         📋 Score {sig['total_score']} < 22 — Sheets only, no Telegram")
 
         except Exception as e:
             log.error(f"         ⚠️ Unexpected error for {symbol}: {e}")
@@ -1555,11 +1605,18 @@ def run_scan(label="Morning Scan"):
     # Sort by total score
     signals.sort(key=lambda s: s["total_score"], reverse=True)
 
-    # Summary message
-    _tg(fmt_summary(signals, label))
+    # Only include score 22+ in summary (GOOD BUY and above)
+    telegram_signals = [s for s in signals if s["total_score"] >= 22]
+    watchlist_signals = [s for s in signals if s["total_score"] < 22]
 
-    # Save for price watcher
-    save_open_trades(signals)
+    log.info(f"  Telegram alerts sent: {len(telegram_signals)} (score 19+)")
+    log.info(f"  Watchlist logged to Sheets only: {len(watchlist_signals)}")
+
+    # Send summary — only for actionable signals
+    _tg(fmt_summary(telegram_signals, label))
+
+    # Save ONLY telegram-worthy signals for price watcher
+    save_open_trades(telegram_signals)
 
     log.info(sep)
     log.info(f"  SCAN COMPLETE — {len(signals)} signal(s)")
