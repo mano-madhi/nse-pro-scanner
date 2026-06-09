@@ -292,14 +292,59 @@ def fetch_fundamentals(symbol: str) -> dict:
         if (data.get("rev_growth_pct") or 0) > 0:     fscore += 1
         data["piotroski"] = fscore
 
-        # ── Promoter pledging (yfinance doesn't have this — set safe default) ─
-        # Screener.in would give this but may be blocked on cloud
-        # We'll treat None as "unknown" and not hard-reject on it
-        data["promoter_pledging"] = None
+        # ── Promoter pledging from NSE India API ─────────────────────────────
+        # NSE India provides shareholding pattern data including pledging
+        try:
+            nse_session = requests.Session()
+            nse_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.nseindia.com/",
+            }
+            # First visit homepage to get cookies
+            nse_session.get("https://www.nseindia.com", headers=nse_headers, timeout=10)
+            # Now fetch shareholding data
+            sh_url = (f"https://www.nseindia.com/api/corporates-shareholding-patterns"
+                      f"?index=equities&symbol={symbol}")
+            sh_resp = nse_session.get(sh_url, headers=nse_headers, timeout=10)
+            if sh_resp.status_code == 200:
+                sh_data = sh_resp.json()
+                # Extract latest pledging from promoter category
+                if sh_data and isinstance(sh_data, list) and len(sh_data) > 0:
+                    latest = sh_data[0]
+                    promoter_data = latest.get("promoterAndPromoterGroupShareholding", {})
+                    pledged = promoter_data.get("pledgedSharesPercentageToTotalCapital", None)
+                    if pledged is not None:
+                        data["promoter_pledging"] = float(pledged)
+                        log.info(f"  Promoter pledging: {data['promoter_pledging']:.1f}% (from NSE)")
+        except Exception as e:
+            data["promoter_pledging"] = None
+            log.warning(f"NSE pledging fetch failed {symbol}: {e}")
 
-        log.info(f"  Fundamentals OK via yfinance: ROE={data.get('roe'):.1f}% D/E={data.get('de')} RevGrow={data.get('rev_growth_pct'):.1f}%"
-                 if data.get("roe") and data.get("de") and data.get("rev_growth_pct") else
-                 f"  Fundamentals fetched (some fields may be missing)")
+        # ── Quarterly profitability check — last 3 quarters ───────────────────
+        # This is our automated replacement for manual Screener check
+        try:
+            qf = tk.quarterly_financials
+            if qf is not None and not qf.empty:
+                net_income_row = None
+                for idx in qf.index:
+                    if "net income" in str(idx).lower() or "profit" in str(idx).lower():
+                        net_income_row = idx
+                        break
+                if net_income_row is not None:
+                    last_3q = qf.loc[net_income_row].iloc[:3].tolist()
+                    profitable_quarters = sum(1 for v in last_3q if v is not None and float(v) > 0)
+                    data["profitable_quarters"] = profitable_quarters
+                    data["quarterly_profits"]   = [round(float(v)/1e7, 1) if v is not None else None for v in last_3q]
+                    log.info(f"  Quarterly: {profitable_quarters}/3 quarters profitable")
+                else:
+                    data["profitable_quarters"] = None
+        except Exception as e:
+            data["profitable_quarters"] = None
+            log.warning(f"Quarterly check failed {symbol}: {e}")
+
+        log.info(f"  Fundamentals fetched (some fields may be missing)")
 
     except Exception as e:
         log.warning(f"yfinance fundamentals failed for {symbol}: {e}")
@@ -551,6 +596,18 @@ def fundamental_score(sym: str, sector: str, fd: dict) -> tuple[bool, str, int, 
     if pio <= 2:
         return False, f"Piotroski {pio}/9 — company fundamentally weakening", 0, []
 
+    # 8. Quarterly profitability — last 3 quarters
+    # If data available: at least 2 out of 3 recent quarters must be profitable
+    q_profit = fd.get("profitable_quarters")
+    if q_profit is not None and q_profit < 2:
+        return False, f"Only {q_profit}/3 recent quarters profitable — inconsistent earnings", 0, []
+
+    # 8. Quarterly profitability — last 3 quarters check
+    # If we have data and company lost money in 2+ of last 3 quarters → reject
+    pq = fd.get("profitable_quarters")
+    if pq is not None and pq <= 1:
+        return False, f"Only {pq}/3 recent quarters profitable — not consistently earning", 0, []
+
     # ── SCORING ───────────────────────────────────────────────────────────────
 
     # ROE (max 2)
@@ -627,6 +684,13 @@ def fundamental_score(sym: str, sector: str, fd: dict) -> tuple[bool, str, int, 
     if pio >= 7:   score += 1; card.append(f"Piotroski {pio}/9 ★★")
     elif pio >= 5: card.append(f"Piotroski {pio}/9")
     else:          card.append(f"⚠️ Piotroski {pio}/9 (weak)")
+
+    # Quarterly profitability bonus
+    if q_profit is not None:
+        if q_profit == 3: score += 1; card.append("3/3 quarters profitable ★★")
+        elif q_profit == 2: card.append("2/3 quarters profitable ★")
+    else:
+        card.append("Quarterly: data pending")
 
     # ── Minimum: 5/12 from REAL data (no missing data bonuses anymore) ─────────
     if score < 5:
@@ -1053,15 +1117,16 @@ def entry_score(df: pd.DataFrame, sr: dict, fd: dict) -> tuple[bool, int, list, 
             card.append(f"⚠️ Resistance at ₹{near_res['level']} ({upside_to_res:.1f}% away) — may limit upside")
 
     entry_data = {
-        "rsi":         rsi,
-        "macd_cross":  macd_cross,
-        "stoch_k":     stoch_k,
-        "near_support": near_sup,
+        "rsi":           rsi,
+        "macd_cross":    macd_cross,
+        "stoch_k":       stoch_k,
+        "near_support":  near_sup,
         "near_resistance": near_res,
-        "vol_drying":  vol_drying if volrat else False,
+        "vol_drying":    vol_drying if volrat else False,
         "buyers_coming": buyers_coming if volrat else False,
-        "obv_positive": (obv > obv_ema) if (obv and obv_ema) else False,
-        "atr":         atr,
+        "obv_positive":  (obv > obv_ema) if (obv and obv_ema) else False,
+        "atr":           atr,
+        "sr_zones":      sr,     # full S/R zones for technical target calculation
     }
 
     return True, score, card, entry_data
@@ -1123,17 +1188,55 @@ def build_signal(symbol: str, sector: str,
     if sl_pct < 1.0 or sl_pct > 8.0:
         return None
 
-    t1 = round(close * 1.05,  2)
-    t2 = round(close * 1.10,  2)
-    t3 = round(close * 1.15,  2)
+    # ── TECHNICAL TARGET CALCULATION ─────────────────────────────────────────
+    # Based on: (1) Resistance zones above entry, (2) Measured move from SL distance
+    # NOT fixed percentages — every stock gets its own technical targets
 
-    near_res = entry_data.get("near_resistance")
-    if near_res:
-        res_pct = (near_res["level"] - close) / close * 100
-        if res_pct < 8:
-            t1 = round(min(t1, near_res["level"] * 0.995), 2)
+    sl_dist = close - sl          # actual risk per share (measured move unit)
+    buy_ref = buy_high            # reference from top of buy zone
 
-    rr = round((t2 - close) / (close - sl), 1)
+    # Measured move targets using SL distance as unit
+    mm_t1 = buy_ref + 2.0 * sl_dist    # 2:1 reward
+    mm_t2 = buy_ref + 4.0 * sl_dist    # 4:1 reward
+    mm_t3 = buy_ref + 6.0 * sl_dist    # 6:1 reward
+
+    # Minimum technical floors (ensures T always above buy price)
+    min_t1 = buy_ref * 1.03    # at least 3% above buy
+    min_t2 = buy_ref * 1.07    # at least 7% above buy
+    min_t3 = buy_ref * 1.12    # at least 12% above buy
+
+    # Get all resistance zones above entry from S/R analysis
+    sr_zones = entry_data.get("sr_zones", {})
+    resistances = sr_zones.get("resistances", []) if sr_zones else []
+    res_above = sorted(
+        [r["level"] for r in resistances if r["level"] > buy_ref * 1.02],
+    )
+
+    # T1 — first resistance above entry OR measured move, whichever is lower
+    # (take the closer target as T1 — book profits at first opportunity)
+    if res_above:
+        res_t1 = res_above[0] * 0.998   # just below resistance
+        t1 = max(min(res_t1, mm_t1), min_t1)
+    else:
+        t1 = max(mm_t1, min_t1)
+
+    # T2 — second resistance OR measured move
+    if len(res_above) >= 2:
+        res_t2 = res_above[1] * 0.998
+        t2 = max(res_t2, mm_t2, min_t2)
+    else:
+        t2 = max(mm_t2, min_t2)
+
+    # T3 — extended measured move (no resistance cap — let it run)
+    t3 = max(mm_t3, min_t3)
+
+    # Safety: strict ordering — T1 < T2 < T3, all above buy_high
+    t1 = round(max(t1, buy_ref * 1.02), 2)
+    t2 = round(max(t2, t1 * 1.03), 2)
+    t3 = round(max(t3, t2 * 1.03), 2)
+
+    # ── Risk : Reward (based on T2) ───────────────────────────────────────────
+    rr = round((t2 - buy_ref) / sl_dist, 1)
 
     if rr < 1.5:
         return None   # must have at least 1.5 RR
@@ -1171,6 +1274,7 @@ def build_signal(symbol: str, sector: str,
         "close":        close,
         "buy_low":      buy_low,
         "buy_high":     buy_high,
+        "buy_ref":      buy_ref,    # reference price for target % calculations
         "sl":           sl,
         "sl_type":      sl_type,
         "sl_pct":       sl_pct,
@@ -1196,6 +1300,8 @@ def build_signal(symbol: str, sector: str,
         "piotroski":    fd.get("piotroski"),
         "pe":           fd.get("pe"),
         "market_cap":   fd.get("market_cap_cr"),
+        "profitable_quarters": fd.get("profitable_quarters"),
+        "quarterly_profits":   fd.get("quarterly_profits"),
         # Technicals
         "rsi":          entry_data.get("rsi"),
         "macd_cross":   entry_data.get("macd_cross"),
@@ -1207,6 +1313,9 @@ def build_signal(symbol: str, sector: str,
         "buyers_coming":entry_data.get("buyers_coming"),
         "obv_positive": entry_data.get("obv_positive"),
         "atr":          round(atr, 2),
+        "profitable_q": fd.get("profitable_quarters"),
+        "quarterly_profits": fd.get("quarterly_profits"),
+        "pledging_nse": fd.get("promoter_pledging"),
     }
 
 
@@ -1260,15 +1369,18 @@ def fmt_buy_alert(sig: dict) -> str:
     sup_s = f"₹{sig['near_support']} ({sig['sup_bounces']}× bounce) ✅" if sig.get("near_support") else "No nearby zone"
     res_s = f"₹{sig['near_res']} ({round((sig['near_res']-sig['close'])/sig['close']*100,1):+.1f}%)" if sig.get("near_res") else "Clear path"
 
-    # Screener.in quick check link
-    screener_url = f"https://www.screener.in/company/{sig['symbol']}/"
+    # Profit/loss amounts for ₹1L investment
+    buy_ref   = sig.get("buy_ref", sig["buy_high"])
+    invest    = 100000
+    qty       = max(1, int(invest / buy_ref))
+    sl_loss   = round(qty * (buy_ref - sig["sl"]), 0)
+    t1_profit = round(qty * (sig["t1"] - buy_ref), 0)
+    t2_profit = round(qty * (sig["t2"] - buy_ref), 0)
 
-    # Profit amounts (for ₹1 lakh investment as example)
-    invest = 100000
-    qty    = int(invest / sig["buy_high"])
-    sl_loss   = round(qty * (sig["buy_high"] - sig["sl"]), 0)
-    t1_profit = round(qty * (sig["t1"] - sig["buy_high"]), 0)
-    t2_profit = round(qty * (sig["t2"] - sig["buy_high"]), 0)
+    # T1/T2/T3 percentage gains from buy reference
+    t1_pct = round((sig["t1"] - buy_ref) / buy_ref * 100, 1)
+    t2_pct = round((sig["t2"] - buy_ref) / buy_ref * 100, 1)
+    t3_pct = round((sig["t3"] - buy_ref) / buy_ref * 100, 1)
 
     return (
         f"{sig['conv_emoji']} <b>{sig['conviction']}</b>\n"
@@ -1280,16 +1392,16 @@ def fmt_buy_alert(sig: dict) -> str:
         f"   Entry  :  ₹{sig['buy_low']} – ₹{sig['buy_high']}\n"
         f"   SL     :  ₹{sig['sl']}  (−{sig['sl_pct']}%)\n"
         f"\n"
-        f"🎯 <b>TARGETS</b>\n"
-        f"   T1 +5%  :  ₹{sig['t1']}  → Book 30-40% here\n"
-        f"   T2 +10% :  ₹{sig['t2']}  → <b>Main target</b>\n"
-        f"   T3 +15% :  ₹{sig['t3']}  → Trail SL\n"
+        f"🎯 <b>TARGETS  (Technical)</b>\n"
+        f"   T1 +{t1_pct}%  :  ₹{sig['t1']}  → Book 30-40% here\n"
+        f"   T2 +{t2_pct}%  :  ₹{sig['t2']}  → <b>Main target</b>\n"
+        f"   T3 +{t3_pct}%  :  ₹{sig['t3']}  → Trail SL\n"
         f"   RR Ratio:  1 : {sig['rr_ratio']}\n"
         f"\n"
         f"💵 <b>On ₹1L investment (~{qty} shares)</b>\n"
-        f"   Risk (SL hit)  : −₹{sl_loss:,.0f}\n"
-        f"   T1 profit      : +₹{t1_profit:,.0f}\n"
-        f"   T2 profit      : +₹{t2_profit:,.0f}\n"
+        f"   If SL hits  : −₹{sl_loss:,.0f}\n"
+        f"   T1 profit   : +₹{t1_profit:,.0f}\n"
+        f"   T2 profit   : +₹{t2_profit:,.0f}\n"
         f"\n"
         f"{'─'*28}\n"
         f"🏢 <b>FUNDAMENTALS</b>  ({sig['f_score']}/12)\n"
@@ -1312,13 +1424,6 @@ def fmt_buy_alert(sig: dict) -> str:
         f"   Support    :  {sup_s}\n"
         f"   Resistance :  {res_s}\n"
         f"   Volume     :  {vol_s}\n"
-        f"\n"
-        f"{'─'*28}\n"
-        f"🔍 <b>VERIFY BEFORE ENTRY</b>\n"
-        f"   <a href='{screener_url}'>📊 Check on Screener.in</a>\n"
-        f"   ✔ Promoter pledging &lt;15%?\n"
-        f"   ✔ Last 3 quarters profitable?\n"
-        f"   ✔ No recent bad news?\n"
         f"\n"
         f"🕐 {sig['scan_time']}\n"
         f"⚠️ <i>Paper trade first. Always set SL.</i>"
