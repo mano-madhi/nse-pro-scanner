@@ -897,10 +897,10 @@ def nearest_resistance(price: float, zones: list) -> dict | None:
 # 6.  TREND & EMA STACK SCORER  (Tier 2 — max 8 points)
 # ════════════════════════════════════════════════════════════════════════════
 
-def trend_score(df: pd.DataFrame, fd: dict) -> tuple[bool, int, list]:
+def trend_score(df: pd.DataFrame, fd: dict) -> tuple[bool, int, list, float]:
     """
     Evaluates the full EMA stack and long-term trend.
-    Returns (passes, score, reasons).
+    Returns (passes, score, reasons, ema200_gap).
     Hard reject if price is more than 5% below EMA200.
     """
     last  = df.iloc[-1]
@@ -924,18 +924,20 @@ def trend_score(df: pd.DataFrame, fd: dict) -> tuple[bool, int, list]:
     adx    = s("adx")
 
     if ema200 is None:
-        return False, 0, []
+        return False, 0, [], 0.0
 
     # ── Hard reject: too far below EMA200 ────────────────────────────────────
     ema200_gap = (close - ema200) / ema200 * 100
     if ema200_gap < -5:
-        return False, 0, []
+        return False, 0, [], ema200_gap
 
     # 1. Price above EMA200 — long term uptrend  (2 pts)
     if close >= ema200:
         score += 2; card.append("Price > EMA200 ✅ (long term uptrend)")
-    else:
+    elif ema200_gap >= -2:
         score += 1; card.append(f"Price near EMA200 ({ema200_gap:.1f}%) — recovering")
+    else:
+        score += 1; card.append(f"Price {ema200_gap:.1f}% below EMA200 — deeper dip")
 
     # 2. EMA50 above EMA200 — medium term healthy  (2 pts)
     if ema50 and ema50 > ema200:
@@ -971,9 +973,7 @@ def trend_score(df: pd.DataFrame, fd: dict) -> tuple[bool, int, list]:
     low52  = fd.get("52w_low")  or float(df["Low"].tail(252).min())
     dip_pct = (high52 - close) / high52 * 100
 
-    return True, score, card
-
-
+    return True, score, card, ema200_gap
 # ════════════════════════════════════════════════════════════════════════════
 # 7.  ENTRY TIMING SCORER  (Tier 3 — max 10 points)
 # ════════════════════════════════════════════════════════════════════════════
@@ -1133,6 +1133,184 @@ def entry_score(df: pd.DataFrame, sr: dict, fd: dict) -> tuple[bool, int, list, 
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 7B.  SENTIMENT CHECK  (Tier 4 — News + FII/DII flows, max 5 points)
+#      Runs ONLY on stocks that already passed Tiers 1–3.
+#      Not a hard score requirement (max 3 from this section is informational +
+#      a small swing in the final score), but a HARD RED FLAG (negative news +
+#      FII/DII selling together) downgrades GOOD BUY -> WATCHLIST and is
+#      clearly shown in the Telegram alert so you can verify before entry.
+# ════════════════════════════════════════════════════════════════════════════
+
+_NEG_KEYWORDS = [
+    "fraud", "raid", "scam", "probe", "investigation", "sebi action",
+    "default", "downgrade", "resign", "resignation", "fire", "explosion",
+    "accident", "ban", "penalty", "fine", "lawsuit", "scandal",
+    "insider trading", "auditor resign", "stake sale", "pledge increase",
+    "debt restructur", "loss widens", "plant shut", "strike", "layoff",
+    "rating cut", "going concern",
+]
+
+_POS_KEYWORDS = [
+    "order win", "bags order", "wins contract", "expansion", "capacity expansion",
+    "upgrade", "record profit", "record revenue", "new plant", "stake buy",
+    "buyback", "dividend", "fii buy", "block deal buy",
+]
+
+
+def fetch_news_sentiment(symbol: str, company_hint: str = "") -> dict:
+    """
+    Free, no-API-key news check via Google News RSS.
+    Scans the latest headlines for the stock and flags strong
+    negative/positive keywords. Best-effort only — if it fails,
+    returns a neutral result (does not block the signal).
+    """
+    result = {"checked": False, "neg_hits": [], "pos_hits": [], "note": None}
+    try:
+        query = f"{symbol} share"
+        url = (f"https://news.google.com/rss/search?q={requests.utils.quote(query)}"
+               f"+stock+NSE&hl=en-IN&gl=IN&ceid=IN:en")
+        resp = requests.get(url, headers=SCREENER_HEADERS, timeout=8)
+        if resp.status_code != 200:
+            return result
+
+        soup = BeautifulSoup(resp.text, "xml")
+        items = soup.find_all("item")[:8]   # latest ~8 headlines
+        headlines = [it.title.text for it in items if it.title]
+
+        for h in headlines:
+            hl = h.lower()
+            for kw in _NEG_KEYWORDS:
+                if kw in hl:
+                    result["neg_hits"].append((kw, h))
+                    break
+            for kw in _POS_KEYWORDS:
+                if kw in hl:
+                    result["pos_hits"].append((kw, h))
+                    break
+
+        result["checked"] = True
+        if headlines:
+            result["note"] = headlines[0][:90]   # top headline as context
+
+    except Exception as e:
+        log.warning(f"News sentiment fetch failed for {symbol}: {e}")
+
+    return result
+
+
+def fetch_fii_dii_activity(symbol: str) -> dict:
+    """
+    Checks NSE bulk-deals data for recent FII/DII/large institutional
+    buy or sell activity in this stock (last available trading session).
+    Best-effort — returns neutral if NSE blocks/limits the request.
+    """
+    result = {"checked": False, "net_buy": None, "note": None}
+    try:
+        nse_session = requests.Session()
+        nse_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/",
+        }
+        nse_session.get("https://www.nseindia.com", headers=nse_headers, timeout=10)
+        url = "https://www.nseindia.com/api/historical/bulk-deals"
+        resp = nse_session.get(url, headers=nse_headers, timeout=10)
+        if resp.status_code != 200:
+            return result
+
+        data = resp.json()
+        rows = data.get("data", []) if isinstance(data, dict) else []
+        buy_qty = sell_qty = 0
+        hits = 0
+        for row in rows:
+            sym = (row.get("BD_SYMBOL") or row.get("symbol") or "").upper()
+            if sym != symbol.upper():
+                continue
+            hits += 1
+            qty = float(row.get("BD_QTY_TRD") or row.get("quantity") or 0)
+            txn = (row.get("BD_BUY_SELL") or row.get("buySell") or "").upper()
+            if txn.startswith("B"):
+                buy_qty += qty
+            elif txn.startswith("S"):
+                sell_qty += qty
+
+        if hits:
+            net = buy_qty - sell_qty
+            result["checked"] = True
+            result["net_buy"] = net
+            if net > 0:
+                result["note"] = f"Bulk deals: net BUY ({hits} entries)"
+            elif net < 0:
+                result["note"] = f"Bulk deals: net SELL ({hits} entries)"
+            else:
+                result["note"] = f"Bulk deals: balanced ({hits} entries)"
+
+    except Exception as e:
+        log.warning(f"FII/DII bulk-deal fetch failed for {symbol}: {e}")
+
+    return result
+
+
+def sentiment_score(symbol: str) -> dict:
+    """
+    Tier 4 — combines news sentiment + FII/DII bulk-deal activity.
+    Returns dict with:
+      score        : -2 to +3 (added to total, capped so it can't push
+                      a stock from WATCHLIST to BUY on its own)
+      flags        : list of human-readable warning/positive strings
+      hard_red_flag: True if negative news + FII/DII selling both present
+      news_note    : top headline (for context, shown in alert)
+      fii_dii_note : bulk deal summary (shown in alert)
+    """
+    news = fetch_news_sentiment(symbol)
+    fii  = fetch_fii_dii_activity(symbol)
+
+    score = 0
+    flags = []
+    hard_red_flag = False
+
+    if news["checked"]:
+        if news["neg_hits"]:
+            score -= 2
+            for kw, h in news["neg_hits"][:2]:
+                flags.append(f"⚠️ News flag ('{kw}'): {h[:70]}")
+        if news["pos_hits"] and not news["neg_hits"]:
+            score += 1
+            kw, h = news["pos_hits"][0]
+            flags.append(f"✅ Positive news: {h[:70]}")
+    else:
+        flags.append("ℹ️ News check unavailable (skipped)")
+
+    if fii["checked"]:
+        if fii["net_buy"] is not None:
+            if fii["net_buy"] > 0:
+                score += 1
+                flags.append("✅ Recent bulk deals: net institutional BUY")
+            elif fii["net_buy"] < 0:
+                score -= 1
+                flags.append("⚠️ Recent bulk deals: net institutional SELL")
+    else:
+        flags.append("ℹ️ FII/DII bulk-deal check unavailable (skipped)")
+
+    # Hard red flag: bad news AND institutional selling together
+    if news["checked"] and news["neg_hits"] and fii["checked"] and (fii["net_buy"] or 0) < 0:
+        hard_red_flag = True
+        flags.insert(0, "🛑 HARD FLAG: Negative news + institutional selling — verify before entry!")
+
+    # Cap score contribution to -2..+2 so this tier alone can't flip conviction tiers
+    score = max(-2, min(2, score))
+
+    return {
+        "score": score,
+        "flags": flags,
+        "hard_red_flag": hard_red_flag,
+        "news_note": news.get("note"),
+        "fii_dii_note": fii.get("note"),
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 8.  MASTER SIGNAL ASSEMBLER
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -1152,7 +1330,8 @@ def get_conviction(score: int) -> tuple[str, str]:
 def build_signal(symbol: str, sector: str,
                  df: pd.DataFrame, fd: dict,
                  f_score: int, t_score: int, e_score: int,
-                 entry_data: dict) -> dict | None:
+                 entry_data: dict, ema200_gap: float = 0.0,
+                 sentiment_data: dict | None = None) -> dict | None:
 
     close = float(df["Close"].iloc[-1])
     atr   = entry_data.get("atr")
@@ -1248,7 +1427,20 @@ def build_signal(symbol: str, sector: str,
     if total < 13:
         return None
 
-    conviction, conv_emoji = get_conviction(total)
+    # ── Tier 4: Sentiment / News / FII-DII adjustment ─────────────────────────
+    sentiment_data = sentiment_data or {}
+    sent_adj  = sentiment_data.get("score", 0)
+    hard_flag = sentiment_data.get("hard_red_flag", False)
+
+    total_adjusted = max(0, min(30, total + sent_adj))
+    conviction, conv_emoji = get_conviction(total_adjusted)
+
+    # Hard red flag (bad news + institutional selling) — force downgrade
+    # from BUY tiers to WATCHLIST regardless of technical score, so it
+    # won't go to Telegram without your manual review.
+    if hard_flag and conviction != "WATCHLIST ★":
+        conviction, conv_emoji = "WATCHLIST ★", "🟡"
+        total_adjusted = min(total_adjusted, 18)
 
     # ── Timeframe ─────────────────────────────────────────────────────────────
     if dip_pct <= 8:
@@ -1266,7 +1458,7 @@ def build_signal(symbol: str, sector: str,
         # Conviction
         "conviction":   conviction,
         "conv_emoji":   conv_emoji,
-        "total_score":  total,
+        "total_score":  total_adjusted,
         "f_score":      f_score,
         "t_score":      t_score,
         "e_score":      e_score,
@@ -1316,6 +1508,14 @@ def build_signal(symbol: str, sector: str,
         "profitable_q": fd.get("profitable_quarters"),
         "quarterly_profits": fd.get("quarterly_profits"),
         "pledging_nse": fd.get("promoter_pledging"),
+        # EMA200 status
+        "ema200_gap":   round(ema200_gap, 1),
+        "above_ema200": ema200_gap >= 0,
+        # Sentiment / News / FII-DII (Tier 4) — filled in by run_scan
+        "sentiment_flags": sentiment_data.get("flags", []),
+        "sentiment_score": sent_adj,
+        "fii_dii_note":    sentiment_data.get("fii_dii_note"),
+        "news_note":       sentiment_data.get("news_note"),
     }
 
 
@@ -1369,6 +1569,21 @@ def fmt_buy_alert(sig: dict) -> str:
     sup_s = f"₹{sig['near_support']} ({sig['sup_bounces']}× bounce) ✅" if sig.get("near_support") else "No nearby zone"
     res_s = f"₹{sig['near_res']} ({round((sig['near_res']-sig['close'])/sig['close']*100,1):+.1f}%)" if sig.get("near_res") else "Clear path"
 
+    # EMA200 status — accurate gap-based label
+    if sig.get("above_ema200"):
+        ema_status = "✅ Above EMA200"
+    elif sig.get("ema200_gap", 0) >= -2:
+        ema_status = f"⚠️ Near EMA200 ({sig['ema200_gap']}%)"
+    else:
+        ema_status = f"⚠️ Below EMA200 ({sig['ema200_gap']}%)"
+
+    # Sentiment / Tier 4 lines
+    flags = sig.get("sentiment_flags") or []
+    if flags:
+        sent_lines = "\n".join(f"   {f}" for f in flags) + "\n"
+    else:
+        sent_lines = "   No flags — neutral\n"
+
     # Profit/loss amounts for ₹1L investment
     buy_ref   = sig.get("buy_ref", sig["buy_high"])
     invest    = 100000
@@ -1420,10 +1635,14 @@ def fmt_buy_alert(sig: dict) -> str:
         f"   MACD       :  {macd_s}\n"
         f"   Stoch RSI  :  {stoch_s}\n"
         f"   Dip        :  {sig['dip_pct']}% from 52W High ₹{sig['high52']}\n"
-        f"   EMA Trend  :  {'✅ Above EMA200' if sig.get('above_ema200') else '⚠️ Near EMA200'}\n"
+        f"   EMA Trend  :  {ema_status}\n"
         f"   Support    :  {sup_s}\n"
         f"   Resistance :  {res_s}\n"
         f"   Volume     :  {vol_s}\n"
+        f"\n"
+        f"{'─'*28}\n"
+        f"📰 <b>SENTIMENT</b>  (Tier 4: {sig.get('sentiment_score',0):+d}/2)\n"
+        f"{sent_lines}"
         f"\n"
         f"🕐 {sig['scan_time']}\n"
         f"⚠️ <i>Paper trade first. Always set SL.</i>"
@@ -1667,7 +1886,7 @@ def run_scan(label="Morning Scan"):
                 continue
             df = add_indicators(df)
 
-            t_passes, t_score, t_card = trend_score(df, fd)
+            t_passes, t_score, t_card, ema200_gap = trend_score(df, fd)
             if not t_passes:
                 log.info(f"         ✗ Trend: price too far below EMA200")
                 t_fail += 1
@@ -1704,9 +1923,18 @@ def run_scan(label="Morning Scan"):
                 continue
             log.info(f"         ✓ Entry score {e_score}/10")
 
+            # ── Tier 4: Sentiment / News / FII-DII (only for stocks that ──────
+            #            already passed Tiers 1-3, to limit network calls)
+            sent_data = sentiment_score(symbol)
+            if sent_data["flags"]:
+                for f in sent_data["flags"]:
+                    log.info(f"         {f}")
+
             # ── Assemble signal ───────────────────────────────────────────────
             sig = build_signal(symbol, sector, df, fd,
-                               f_score, t_score, e_score, entry_data)
+                               f_score, t_score, e_score, entry_data,
+                               ema200_gap=ema200_gap,
+                               sentiment_data=sent_data)
             if sig is None:
                 log.info(f"         ✗ Signal rejected (RR too poor or SL invalid)")
                 continue
@@ -1800,7 +2028,7 @@ if __name__ == "__main__":
             df = fetch_ohlcv(sym)
             if df is not None:
                 df = add_indicators(df)
-                t_passes, t_score, t_card = trend_score(df, fd)
+                t_passes, t_score, t_card, ema200_gap = trend_score(df, fd)
                 print(f"\n── Trend & EMA Stack ─────────────────────")
                 print(f"Passes: {t_passes}  Score: {t_score}/8")
                 for c in t_card: print(f"  {c}")
@@ -1817,7 +2045,7 @@ if __name__ == "__main__":
                     for c in e_card: print(f"  {c}")
 
                     if e_passes:
-                        sig = build_signal(sym, sector, df, fd, f_score, t_score, e_score, entry_data)
+                        sig = build_signal(sym, sector, df, fd, f_score, t_score, e_score, entry_data, ema200_gap=ema200_gap)
                         if sig:
                             print(f"\n── SIGNAL ────────────────────────────────")
                             print(fmt_buy_alert(sig))
