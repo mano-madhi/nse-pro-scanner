@@ -139,17 +139,145 @@ UNIVERSE = {
         "PAGEIND","DIXON","AMBER","VGUARD","CROMPTON",
         "FINPIPE","NAUKRI","INDIAMART",
     ],
+    "Capital Markets & Exchanges": [
+        "CDSL","BSE","MOTILALOFS","ANGELONE","IEX","CAMS","KFINTECH",
+        "NUVAMA","IIFL","JMFINANCIL",
+    ],
+    "Textiles & Apparel": [
+        "KPRMILL","TRIDENT","WELSPUNIND","VARDHMAN","GOKEX","RAYMOND",
+        "ARVIND",
+    ],
+    "Shipping & Marine Logistics": [
+        "AEGISLOG","GESHIP","GATI","SCI","VRLLOG","MAHLOG",
+    ],
+    "Media & Entertainment": [
+        "PVRINOX","SUNTV","ZEEL","NAZARA","SAREGAMA",
+    ],
+    "Aviation & Travel": [
+        "INDIGO","SPICEJET","IRCTC","THOMASCOOK","EASEMYTRIP",
+    ],
+    "Defence & PSU Diversified": [
+        "HAL","BEL","BEML","MAZDOCK","COCHINSHIP","GRSE",
+        "IRCON","RVNL","NBCC","NLCINDIA",
+    ],
 }
 
 ALL_STOCKS = list(dict.fromkeys(
     sym for stocks in UNIVERSE.values() for sym in stocks
 ))
 
+# ── curated list above now acts as a FALLBACK only ─────────────────────────
+CURATED_FALLBACK = ALL_STOCKS
+
 def nse(sym):
     return f"{sym}.NS"
 
+_DYNAMIC_SECTOR_CACHE: dict = {}
+
 def sector_of(sym):
+    if sym in _DYNAMIC_SECTOR_CACHE:
+        return _DYNAMIC_SECTOR_CACHE[sym]
     return next((s for s, lst in UNIVERSE.items() if sym in lst), "Unknown")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 1b.  FULL NSE UNIVERSE — pulled live, curated list is the fallback only
+# ════════════════════════════════════════════════════════════════════════════
+
+NSE_EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equity/EQUITY_L.csv"
+MIN_AVG_TURNOVER_CR = 5.0     # min avg daily turnover (₹ crore) to be considered liquid
+MIN_PRICE = 20.0              # exclude sub-₹20 stocks (penny/illiquid, unreliable GTT fills)
+LIQUIDITY_LOOKBACK_DAYS = 20  # sessions used to compute avg turnover
+BATCH_SIZE = 200              # yf.download batch size for the pre-filter pass
+
+
+def fetch_nse_equity_list() -> list[str] | None:
+    """
+    Pull NSE's official mainboard equity list (SERIES == EQ only, excludes
+    SME/BE/BZ and other restricted series). Returns None on any failure so
+    the caller can fall back to CURATED_FALLBACK instead of breaking the scan.
+    """
+    try:
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0 Safari/537.36"),
+            "Accept": "text/csv,*/*",
+        }
+        resp = requests.get(NSE_EQUITY_LIST_URL, headers=headers, timeout=20)
+        resp.raise_for_status()
+        from io import StringIO
+        df = pd.read_csv(StringIO(resp.text))
+        df.columns = [c.strip() for c in df.columns]
+        df = df[df["SERIES"].str.strip() == "EQ"]
+        symbols = df["SYMBOL"].str.strip().tolist()
+        if len(symbols) < 500:   # sanity check — a truncated/bad response
+            log.warning(f"NSE equity list looked too small ({len(symbols)}); falling back.")
+            return None
+        return list(dict.fromkeys(symbols))
+    except Exception as e:
+        log.warning(f"Failed to fetch live NSE equity list: {e}. Using curated fallback.")
+        return None
+
+
+def filter_liquid_universe(symbols: list[str]) -> list[str]:
+    """
+    Cheap batched pre-filter: keep only stocks with enough average daily
+    turnover and a sane minimum price, BEFORE the expensive per-stock
+    fundamental + full technical pipeline runs on them. Keeps ~2000 raw
+    NSE symbols down to a tradeable subset that fits the GH Actions time
+    budget and avoids scoring stocks you couldn't reliably fill GTTs on.
+    """
+    liquid = []
+    tickers = [nse(s) for s in symbols]
+    for i in range(0, len(tickers), BATCH_SIZE):
+        chunk = tickers[i:i + BATCH_SIZE]
+        try:
+            data = yf.download(chunk, period="1mo", interval="1d",
+                                group_by="ticker", auto_adjust=True,
+                                progress=False, threads=True)
+        except Exception as e:
+            log.warning(f"Liquidity pre-filter batch {i}-{i+BATCH_SIZE} failed: {e}")
+            continue
+
+        for sym, ticker in zip(symbols[i:i + BATCH_SIZE], chunk):
+            try:
+                sub = data[ticker] if isinstance(data.columns, pd.MultiIndex) else data
+                sub = sub.dropna(subset=["Close", "Volume"]).tail(LIQUIDITY_LOOKBACK_DAYS)
+                if sub.empty:
+                    continue
+                avg_turnover_cr = float((sub["Close"] * sub["Volume"]).mean()) / 1e7
+                last_price = float(sub["Close"].iloc[-1])
+                if avg_turnover_cr >= MIN_AVG_TURNOVER_CR and last_price >= MIN_PRICE:
+                    liquid.append(sym)
+            except Exception:
+                continue
+    return liquid
+
+
+def build_universe() -> list[str]:
+    """
+    Live NSE list -> liquidity filter -> tradeable universe.
+    Falls back to the curated list at any failure point so a bad network
+    day never stops the scan from running.
+    """
+    raw = fetch_nse_equity_list()
+    if not raw:
+        log.warning("Using CURATED_FALLBACK universe (live NSE fetch unavailable).")
+        return CURATED_FALLBACK
+
+    try:
+        liquid = filter_liquid_universe(raw)
+    except Exception as e:
+        log.warning(f"Liquidity filter failed entirely: {e}. Using curated fallback.")
+        return CURATED_FALLBACK
+
+    if len(liquid) < 100:   # filter came back suspiciously small -> distrust it
+        log.warning(f"Liquidity-filtered universe too small ({len(liquid)}); using curated fallback.")
+        return CURATED_FALLBACK
+
+    # Always keep the curated names in too, even if the liquidity pass missed them
+    return list(dict.fromkeys(liquid + CURATED_FALLBACK))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -200,6 +328,7 @@ def fetch_fundamentals(symbol: str) -> dict:
         data["book_value"]      = _parse_num(info.get("bookValue"))
         data["52w_high"]        = _parse_num(info.get("fiftyTwoWeekHigh"))
         data["52w_low"]         = _parse_num(info.get("fiftyTwoWeekLow"))
+        data["sector"]          = info.get("sector") or info.get("industry") or "Unknown"
 
         # Convert ROE from decimal to percentage if needed
         roe = data.get("roe")
@@ -717,6 +846,25 @@ def fetch_ohlcv(symbol: str, period="1y", interval="1d") -> pd.DataFrame | None:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df.index = pd.to_datetime(df.index)
+
+            # ── Drop today's still-forming daily candle ─────────────────────────
+            # The scanner runs twice a day (9:20 AM, 3:00 PM) while the market is
+            # open, so yfinance's most recent daily bar is only partially formed
+            # at scan time -- its Close, and every indicator built on it (RSI,
+            # MACD, ATR, Bollinger, S/R), keeps changing between runs. Dropping
+            # it means every calculation is anchored to the last FULLY COMPLETED
+            # session, so a stock scored strong at 9:20 AM shows identical
+            # entry/SL/target at 3:00 PM the same day. Levels then update once
+            # per day, when a new session actually finalizes -- not per run.
+            today_ist = pd.Timestamp.now(tz="Asia/Kolkata").normalize()
+            last_bar_date = df.index[-1]
+            last_bar_date = (last_bar_date.tz_localize(None)
+                              if last_bar_date.tzinfo else last_bar_date).normalize()
+            if last_bar_date >= today_ist:
+                df = df.iloc[:-1]
+                if df.empty or len(df) < 120:
+                    return None
+
             return df
         except Exception as e:
             if attempt < 2:
@@ -1442,13 +1590,23 @@ def build_signal(symbol: str, sector: str,
         conviction, conv_emoji = "WATCHLIST ★", "🟡"
         total_adjusted = min(total_adjusted, 18)
 
-    # ── Timeframe ─────────────────────────────────────────────────────────────
-    if dip_pct <= 8:
-        timeframe = "1–2 weeks"
-    elif dip_pct <= 15:
-        timeframe = "2–4 weeks"
+    # ── Timeframe / Horizon — ATR-based days-to-target estimate ───────────────
+    # Projects how many trading days T1 should take at this stock's own normal
+    # daily range (ATR), then classifies for capital-recycling purposes:
+    # Momentum Pick = fast in/out, Short Term = medium hold, Long Term =
+    # slow mover but only when fundamentals actually justify holding that long.
+    daily_progress = max(atr * 0.5, 0.01)   # assume ~50% of ATR captured per day, directionally
+    days_to_t1 = max(1, round((t1 - buy_ref) / daily_progress))
+    days_to_t2 = max(days_to_t1, round((t2 - buy_ref) / daily_progress))
+
+    if days_to_t1 <= 7:
+        horizon = "Momentum Pick"
+    elif days_to_t1 <= 20:
+        horizon = "Short Term"
     else:
-        timeframe = "4–8 weeks (patient hold)"
+        horizon = "Long Term" if f_score >= 8 else "Short Term"
+
+    timeframe = f"~{days_to_t1}-{days_to_t2} trading days"
 
     return {
         # Identity
@@ -1475,6 +1633,8 @@ def build_signal(symbol: str, sector: str,
         "t3":           t3,
         "rr_ratio":     rr,
         "timeframe":    timeframe,
+        "horizon":      horizon,
+        "days_to_t1":   days_to_t1,
         # Context
         "high52":       round(high52, 2),
         "low52":        round(low52, 2),
@@ -1598,7 +1758,7 @@ def fmt_buy_alert(sig: dict) -> str:
     t3_pct = round((sig["t3"] - buy_ref) / buy_ref * 100, 1)
 
     return (
-        f"{sig['conv_emoji']} <b>{sig['conviction']}</b>\n"
+        f"{sig['conv_emoji']} <b>{sig['conviction']}</b>  ·  🏷 {sig['horizon']}\n"
         f"<b>📌 {sig['symbol']}</b>  |  {sig['sector']}\n"
         f"⏱ Hold: {sig['timeframe']}  ·  Score: {sig['total_score']}/30\n"
         f"\n"
@@ -1853,19 +2013,24 @@ def run_scan(label="Morning Scan"):
     log.info(sep)
     log.info(f"  NSE PRO SCANNER — {label}")
     log.info(f"  {datetime.now(IST).strftime('%d %b %Y  %I:%M %p IST')}")
-    log.info(f"  Universe: {len(ALL_STOCKS)} stocks")
+
+    universe = build_universe()
+    log.info(f"  Universe: {len(universe)} stocks")
     log.info(sep)
 
     signals = []
     f_fail = t_fail = e_fail = 0
 
-    for i, symbol in enumerate(ALL_STOCKS):
+    for i, symbol in enumerate(universe):
         sector = sector_of(symbol)
-        log.info(f"[{i+1:3}/{len(ALL_STOCKS)}] {symbol:15} ({sector[:20]})")
+        log.info(f"[{i+1:3}/{len(universe)}] {symbol:15} ({sector[:20]})")
 
         try:
             # ── Tier 1: Fundamentals ──────────────────────────────────────────
             fd = fetch_fundamentals(symbol)
+            if fd.get("sector") and fd["sector"] != "Unknown":
+                _DYNAMIC_SECTOR_CACHE[symbol] = fd["sector"]
+                sector = fd["sector"]
             passes, reason, f_score, f_card = fundamental_score(symbol, sector, fd)
             if not passes:
                 log.info(f"         ✗ Fundamental: {reason}")
@@ -2063,16 +2228,17 @@ if __name__ == "__main__":
             _tg(f"🔍 Test: {sym}\nFundamental filter ✗\nReason: {reason}")
 
     elif mode == "fundamentals":
-        log.info(f"Fundamentals-only scan — {len(ALL_STOCKS)} stocks")
+        universe = build_universe()
+        log.info(f"Fundamentals-only scan — {len(universe)} stocks")
         passed = []
-        for sym in ALL_STOCKS:
+        for sym in universe:
             sec = sector_of(sym)
             fd  = fetch_fundamentals(sym)
             ok, reason, fs, card = fundamental_score(sym, sec, fd)
             status = f"✅ {fs:2}/12  {', '.join(card[:3])}" if ok else f"✗  {reason}"
             print(f"{sym:15} {status}")
             if ok: passed.append(sym)
-        print(f"\n{len(passed)}/{len(ALL_STOCKS)} pass fundamental filter.")
+        print(f"\n{len(passed)}/{len(universe)} pass fundamental filter.")
 
     else:
         print("Usage: python scanner.py [scan | watch | test SYMBOL | fundamentals]")
