@@ -196,15 +196,31 @@ def fetch_nse_equity_list() -> list[str] | None:
     Pull NSE's official mainboard equity list (SERIES == EQ only, excludes
     SME/BE/BZ and other restricted series). Returns None on any failure so
     the caller can fall back to CURATED_FALLBACK instead of breaking the scan.
+
+    NSE blocks direct requests that don't carry session cookies established
+    by first visiting the site's homepage -- a bare GET to the CSV endpoint
+    is bot-blocked and returns a 404 rather than a clean 403. So we prime a
+    session against the homepage first, then reuse those cookies for the
+    actual CSV fetch.
     """
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     try:
-        headers = {
-            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/124.0 Safari/537.36"),
-            "Accept": "text/csv,*/*",
-        }
-        resp = requests.get(NSE_EQUITY_LIST_URL, headers=headers, timeout=20)
+        session = requests.Session()
+        session.headers.update(headers)
+        # Prime cookies -- NSE requires a real page hit before it will serve
+        # the archive CSV to a scripted client.
+        session.get("https://www.nseindia.com", timeout=15)
+        session.get("https://www.nseindia.com/market-data/securities-available-for-trading",
+                     timeout=15)
+
+        resp = session.get(NSE_EQUITY_LIST_URL,
+                            headers={"Accept": "text/csv,*/*"}, timeout=20)
         resp.raise_for_status()
         from io import StringIO
         df = pd.read_csv(StringIO(resp.text))
