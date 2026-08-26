@@ -184,7 +184,7 @@ def sector_of(sym):
 # 1b.  FULL NSE UNIVERSE — pulled live, curated list is the fallback only
 # ════════════════════════════════════════════════════════════════════════════
 
-NSE_EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equity/EQUITY_L.csv"
+NSE_EQUITY_LIST_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 MIN_AVG_TURNOVER_CR = 5.0     # min avg daily turnover (₹ crore) to be considered liquid
 MIN_PRICE = 20.0              # exclude sub-₹20 stocks (penny/illiquid, unreliable GTT fills)
 LIQUIDITY_LOOKBACK_DAYS = 20  # sessions used to compute avg turnover
@@ -213,8 +213,8 @@ def fetch_nse_equity_list() -> list[str] | None:
         "Accept-Language": "en-US,en;q=0.9",
     }
     candidate_urls = [
-        "https://nsearchives.nseindia.com/content/equity/EQUITY_L.csv",
-        "https://archives.nseindia.com/content/equity/EQUITY_L.csv",
+        "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
+        "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
     ]
 
     session = requests.Session()
