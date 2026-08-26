@@ -201,7 +201,9 @@ def fetch_nse_equity_list() -> list[str] | None:
     by first visiting the site's homepage -- a bare GET to the CSV endpoint
     is bot-blocked and returns a 404 rather than a clean 403. So we prime a
     session against the homepage first, then reuse those cookies for the
-    actual CSV fetch.
+    actual CSV fetch. Tries a couple of known candidate URLs since NSE has
+    moved this file between domains before. Logs which exact stage fails so
+    a repeat failure is diagnosable from the log alone, no back-and-forth.
     """
     headers = {
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -210,30 +212,47 @@ def fetch_nse_equity_list() -> list[str] | None:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    try:
-        session = requests.Session()
-        session.headers.update(headers)
-        # Prime cookies -- NSE requires a real page hit before it will serve
-        # the archive CSV to a scripted client.
-        session.get("https://www.nseindia.com", timeout=15)
-        session.get("https://www.nseindia.com/market-data/securities-available-for-trading",
-                     timeout=15)
+    candidate_urls = [
+        "https://nsearchives.nseindia.com/content/equity/EQUITY_L.csv",
+        "https://archives.nseindia.com/content/equity/EQUITY_L.csv",
+    ]
 
-        resp = session.get(NSE_EQUITY_LIST_URL,
-                            headers={"Accept": "text/csv,*/*"}, timeout=20)
-        resp.raise_for_status()
-        from io import StringIO
-        df = pd.read_csv(StringIO(resp.text))
-        df.columns = [c.strip() for c in df.columns]
-        df = df[df["SERIES"].str.strip() == "EQ"]
-        symbols = df["SYMBOL"].str.strip().tolist()
-        if len(symbols) < 500:   # sanity check — a truncated/bad response
-            log.warning(f"NSE equity list looked too small ({len(symbols)}); falling back.")
-            return None
-        return list(dict.fromkeys(symbols))
+    session = requests.Session()
+    session.headers.update(headers)
+    try:
+        r1 = session.get("https://www.nseindia.com", timeout=15)
+        log.info(f"[NSE list] homepage priming GET -> status {r1.status_code}")
+        r2 = session.get("https://www.nseindia.com/market-data/securities-available-for-trading",
+                          timeout=15)
+        log.info(f"[NSE list] securities-page priming GET -> status {r2.status_code}")
     except Exception as e:
-        log.warning(f"Failed to fetch live NSE equity list: {e}. Using curated fallback.")
+        log.warning(f"[NSE list] session priming failed: {e}. Using curated fallback.")
         return None
+
+    for url in candidate_urls:
+        try:
+            resp = session.get(url, headers={"Accept": "text/csv,*/*"}, timeout=20)
+            log.info(f"[NSE list] GET {url} -> status {resp.status_code}, "
+                      f"{len(resp.content)} bytes")
+            resp.raise_for_status()
+            from io import StringIO
+            df = pd.read_csv(StringIO(resp.text))
+            df.columns = [c.strip() for c in df.columns]
+            df = df[df["SERIES"].str.strip() == "EQ"]
+            symbols = df["SYMBOL"].str.strip().tolist()
+            if len(symbols) < 500:   # sanity check — a truncated/bad response
+                log.warning(f"[NSE list] {url} returned too few symbols "
+                             f"({len(symbols)}); trying next candidate.")
+                continue
+            log.info(f"[NSE list] Live NSE list fetched OK from {url}: "
+                      f"{len(symbols)} EQ-series symbols.")
+            return list(dict.fromkeys(symbols))
+        except Exception as e:
+            log.warning(f"[NSE list] {url} failed: {e}")
+            continue
+
+    log.warning("[NSE list] All candidate URLs failed. Using curated fallback.")
+    return None
 
 
 def filter_liquid_universe(symbols: list[str]) -> list[str]:
