@@ -1611,10 +1611,12 @@ def build_signal(symbol: str, sector: str,
     t3 = round(max(t3, t2 * 1.03), 2)
 
     # ── Risk : Reward (based on T2) ───────────────────────────────────────────
+    # No minimum enforced here anymore — target and SL both come from real
+    # chart structure (resistance zones, swing points, ATR), so whatever RR
+    # that structure produces is trusted as-is rather than discarding a
+    # structurally-valid setup just because the ratio number looks low.
+    # rr is still calculated and shown on every signal for your own judgment.
     rr = round((t2 - buy_ref) / sl_dist, 1)
-
-    if rr < 1.5:
-        return None   # must have at least 1.5 RR
 
     # ── Total score ───────────────────────────────────────────────────────────
     total = f_score + t_score + e_score
@@ -1989,67 +1991,87 @@ def update_trade(symbol: str, status: str, exit_price: float = None):
 # ════════════════════════════════════════════════════════════════════════════
 
 def watch_open_trades():
-    fpath = Path("open_trades.csv")
-    if not fpath.exists(): return
-    trades = pd.read_csv(fpath)
-    if trades.empty: return
-    closed = []
+    """
+    Checks every OPEN signal in the Google Sheet against current price and
+    reports SL/target hits to Telegram. Reads/writes the Sheet directly --
+    NOT a local file -- because GitHub Actions gives every run a fresh repo
+    checkout, so anything written to disk in one run is gone by the next.
+    A local open_trades.csv can never survive between separate runs; the
+    Sheet is the only thing here that actually persists.
+    """
+    client = sheets_client()
+    if not client:
+        log.warning("Sheets not configured — cannot watch open trades.")
+        return
+    try:
+        sh = client.open(SHEETS_DOC_NAME).worksheet("Signals")
+        data = sh.get_all_values()
+    except Exception as e:
+        log.error(f"Sheets read failed: {e}")
+        return
+    if len(data) < 2:
+        return
 
-    for idx, t in trades.iterrows():
-        sym = t["symbol"]
+    hdr = data[0]
+    def col(name):
+        return hdr.index(name)
+
+    sym_c, stat_c   = col("Symbol"),   col("Status")
+    buy_c, sl_c     = col("Buy Price"), col("SL")
+    t1_c, t2_c, t3_c = col("T1 5%"), col("T2 10%"), col("T3 15%")
+    exit_c, pnl_c   = col("Exit Price"), col("P&L %")
+    notes_c         = col("Notes")
+
+    open_rows = [(i, row) for i, row in enumerate(data[1:], start=2)
+                 if row[stat_c].strip() == "OPEN"]
+    if not open_rows:
+        log.info("No open trades to watch.")
+        return
+    log.info(f"Watching {len(open_rows)} open trade(s)...")
+
+    for row_num, row in open_rows:
+        sym = row[sym_c]
         try:
-            data = yf.download(nse(sym), period="1d", interval="5m",
-                               auto_adjust=True, progress=False)
-            if data.empty: continue
-            cmp = float(data["Close"].iloc[-1])
-        except: continue
+            buy_high, sl = float(row[buy_c]), float(row[sl_c])
+            t1, t2, t3   = float(row[t1_c]), float(row[t2_c]), float(row[t3_c])
+        except (ValueError, IndexError):
+            continue
 
-        sl, t1, t2, t3 = float(t["sl"]), float(t["t1"]), float(t["t2"]), float(t["t3"])
-        t1h = bool(t.get("t1_hit", False))
-        t2h = bool(t.get("t2_hit", False))
+        try:
+            d = yf.download(nse(sym), period="1d", interval="5m",
+                             auto_adjust=True, progress=False)
+            if d.empty:
+                continue
+            cmp = float(d["Close"].iloc[-1])
+        except Exception:
+            continue
 
-        log.info(f"Watching {sym}: ₹{cmp:.2f} | SL:{sl} T1:{t1} T2:{t2}")
+        t1_done = "T1" in row[notes_c]
+        t2_done = "T2" in row[notes_c]
+        log.info(f"  {sym}: ₹{cmp:.2f}  (SL {sl}  T1 {t1}  T2 {t2}  T3 {t3})")
 
         if cmp <= sl:
             _tg(fmt_sl_hit(sym, sl, cmp))
-            update_trade(sym, "SL HIT", cmp)
-            closed.append(idx)
-        elif not t1h and cmp >= t1:
+            sh.update_cell(row_num, stat_c + 1, "SL HIT")
+            sh.update_cell(row_num, exit_c + 1, cmp)
+            sh.update_cell(row_num, pnl_c + 1, f"{(cmp-buy_high)/buy_high*100:.2f}%")
+
+        elif not t1_done and cmp >= t1:
             _tg(fmt_target_hit(sym, 1, t1, cmp, 5))
-            trades.at[idx, "t1_hit"] = True
-            trades.at[idx, "sl"]     = float(t["buy_high"])   # move SL to entry
-            update_trade(sym, "T1 HIT (5%)")
-        elif t1h and not t2h and cmp >= t2:
+            sh.update_cell(row_num, notes_c + 1, (row[notes_c] + " T1").strip())
+            sh.update_cell(row_num, sl_c + 1, buy_high)   # move SL to breakeven
+            sh.update_cell(row_num, stat_c + 1, "T1 HIT (SL->breakeven)")
+
+        elif t1_done and not t2_done and cmp >= t2:
             _tg(fmt_target_hit(sym, 2, t2, cmp, 10, is_t2=True))
-            trades.at[idx, "t2_hit"] = True
-            update_trade(sym, "T2 HIT (10%)")
-        elif t2h and cmp >= t3:
+            sh.update_cell(row_num, notes_c + 1, (row[notes_c] + " T2").strip())
+            sh.update_cell(row_num, stat_c + 1, "T2 HIT")
+
+        elif t2_done and cmp >= t3:
             _tg(fmt_target_hit(sym, 3, t3, cmp, 15))
-            update_trade(sym, "T3 HIT (15%)", cmp)
-            closed.append(idx)
-
-    trades = trades.drop(index=closed).reset_index(drop=True)
-    trades.to_csv(fpath, index=False)
-
-
-def save_open_trades(signals: list):
-    fpath = Path("open_trades.csv")
-    cols  = ["symbol","buy_high","sl","t1","t2","t3","t1_hit","t2_hit","scan_time"]
-    rows  = [{
-        "symbol": s["symbol"], "buy_high": s["buy_high"],
-        "sl": s["sl"], "t1": s["t1"], "t2": s["t2"], "t3": s["t3"],
-        "t1_hit": False, "t2_hit": False, "scan_time": s["scan_time"],
-    } for s in signals]
-    if not rows: return
-    new_df = pd.DataFrame(rows, columns=cols)
-    if fpath.exists():
-        existing = pd.read_csv(fpath)
-        new_df = new_df[~new_df["symbol"].isin(existing["symbol"])]
-        combined = pd.concat([existing, new_df], ignore_index=True)
-    else:
-        combined = new_df
-    combined.to_csv(fpath, index=False)
-    log.info(f"Open trades saved: {len(combined)}")
+            sh.update_cell(row_num, stat_c + 1, "T3 HIT — CLOSED")
+            sh.update_cell(row_num, exit_c + 1, cmp)
+            sh.update_cell(row_num, pnl_c + 1, f"{(cmp-buy_high)/buy_high*100:.2f}%")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2106,9 +2128,10 @@ def run_scan(label="Morning Scan"):
                 t_fail += 1
                 continue
 
-            # Minimum Tier 2 score: 3/8 — ensures at least basic trend alignment
-            if t_score < 3:
-                log.info(f"         ✗ Trend score {t_score}/8 too weak (min 3) — not in buy zone")
+            # Minimum Tier 2 score: 5/8 — needs genuine trend confluence, not
+            # just barely-in-buy-zone. Raised from 3/8 for a stricter filter.
+            if t_score < 5:
+                log.info(f"         ✗ Trend score {t_score}/8 too weak (min 5) — not in buy zone")
                 t_fail += 1
                 continue
             log.info(f"         ✓ Trend score {t_score}/8")
@@ -2130,9 +2153,10 @@ def run_scan(label="Morning Scan"):
                 e_fail += 1
                 continue
 
-            # Minimum Tier 3 score: 4/10 — ensures proper entry timing
-            if e_score < 4:
-                log.info(f"         ✗ Entry score {e_score}/10 too weak (min 4) — timing not right")
+            # Minimum Tier 3 score: 7/10 — needs multiple entry-timing signals
+            # agreeing together, not just a bare pass. Raised from 4/10.
+            if e_score < 7:
+                log.info(f"         ✗ Entry score {e_score}/10 too weak (min 7) — timing not right")
                 e_fail += 1
                 continue
             log.info(f"         ✓ Entry score {e_score}/10")
@@ -2192,8 +2216,9 @@ def run_scan(label="Morning Scan"):
     # Send summary — only for actionable signals
     _tg(fmt_summary(telegram_signals, label))
 
-    # Save ONLY telegram-worthy signals for price watcher
-    save_open_trades(telegram_signals)
+    # No separate save step needed — log_to_sheets() already wrote each
+    # telegram-worthy signal to the Sheet with Status=OPEN, and that Sheet
+    # (not a local file) is what watch_open_trades() reads from.
 
     log.info(sep)
     log.info(f"  SCAN COMPLETE — {len(signals)} signal(s)")
@@ -2216,15 +2241,16 @@ if __name__ == "__main__":
         run_scan(label)
 
     elif mode == "watch":
-        log.info("Price watcher running (every 5 min during market hours)...")
-        while True:
-            now = datetime.now(IST)
-            if now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) <= (15, 30):
-                watch_open_trades()
-                time.sleep(300)
-            else:
-                log.info("Outside market hours. Sleeping 10 min...")
-                time.sleep(600)
+        # Runs ONCE and exits -- the repeated execution comes from the
+        # watcher.yml workflow's own schedule (every ~15 min during market
+        # hours), not from an internal loop. A long-lived while-loop doesn't
+        # fit a GitHub Actions job, which gets a fresh, short-lived runner
+        # each time rather than one continuously running process.
+        now = datetime.now(IST)
+        if now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) <= (15, 30):
+            watch_open_trades()
+        else:
+            log.info("Outside market hours — skipping this watch run.")
 
     elif mode == "test":
         sym = sys.argv[2] if len(sys.argv) > 2 else "HDFCBANK"
