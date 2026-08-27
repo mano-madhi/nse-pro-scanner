@@ -715,7 +715,11 @@ IS_BANK = {"Banking & Finance"}
 def fundamental_score(sym: str, sector: str, fd: dict) -> tuple[bool, str, int, list]:
     """
     STRONG fundamental filter — institutional grade.
-    Minimum score raised to 6/12. Hard rejects are strict.
+    Real max score is 14 (not 12 — the old docstring/labels undercounted).
+    Missing data is no longer a free pass: a stock needs real numbers on
+    most core metrics to be trusted, not just a couple of favorable ones
+    surrounded by "unavailable" — that combination was letting thinly-
+    covered small caps through without genuine verification.
     """
     if not fd:
         return False, "No fundamental data available", 0, []
@@ -772,6 +776,19 @@ def fundamental_score(sym: str, sector: str, fd: dict) -> tuple[bool, str, int, 
     if pq is not None and pq <= 1:
         return False, f"Only {pq}/3 recent quarters profitable — not consistently earning", 0, []
 
+    # ── DATA COVERAGE REQUIREMENT ───────────────────────────────────────────────
+    # A stock can't be trusted as "strong fundamentals" if most of the core
+    # metrics are simply missing — that's unverified, not verified-good.
+    # Require at least 6 of these 8 core fields to have real data.
+    roce  = fd.get("roce")
+    de    = fd.get("de")
+    eps_g = fd.get("eps_growth_yoy")
+    fcf   = fd.get("fcf")
+    core_fields = [roe, roce, nm, de, rev_g, eps_g, fcf, pio]
+    coverage = sum(1 for v in core_fields if v is not None)
+    if coverage < 6:
+        return False, f"Only {coverage}/8 core fundamentals available — data too thin to trust", 0, []
+
     # ── SCORING ───────────────────────────────────────────────────────────────
 
     # ROE (max 2)
@@ -783,7 +800,6 @@ def fundamental_score(sym: str, sector: str, fd: dict) -> tuple[bool, str, int, 
         card.append("ROE: unavailable")   # NO bonus for missing data
 
     # ROCE (max 2)
-    roce = fd.get("roce")
     if roce is not None:
         if roce >= 20:   score += 2; card.append(f"ROCE {roce:.1f}% ★★")
         elif roce >= 12: score += 1; card.append(f"ROCE {roce:.1f}% ★")
@@ -799,7 +815,6 @@ def fundamental_score(sym: str, sector: str, fd: dict) -> tuple[bool, str, int, 
         card.append("Net Margin: unavailable")  # NO bonus
 
     # Debt/Equity (max 2)
-    de = fd.get("de")
     if de is not None:
         if de <= (3.0 if is_bank else 0.3):
             score += 2; card.append(f"D/E {de:.2f} ★★ (very low debt)")
@@ -819,7 +834,6 @@ def fundamental_score(sym: str, sector: str, fd: dict) -> tuple[bool, str, int, 
         card.append("Rev Growth: unavailable")  # NO bonus
 
     # EPS Growth (max 1)
-    eps_g = fd.get("eps_growth_yoy")
     if eps_g is not None:
         if eps_g >= 15:  score += 1; card.append(f"EPS Growth {eps_g:.1f}% ★")
         elif eps_g >= 0: card.append(f"EPS Growth {eps_g:.1f}%")
@@ -828,7 +842,6 @@ def fundamental_score(sym: str, sector: str, fd: dict) -> tuple[bool, str, int, 
         card.append("EPS Growth: unavailable")  # NO bonus
 
     # FCF (max 1)
-    fcf = fd.get("fcf")
     if fcf is not None:
         if fcf > 0: score += 1; card.append(f"FCF ₹{fcf:.0f}Cr ★")
         else:       card.append(f"⚠️ FCF negative")
@@ -856,9 +869,9 @@ def fundamental_score(sym: str, sector: str, fd: dict) -> tuple[bool, str, int, 
     else:
         card.append("Quarterly: data pending")
 
-    # ── Minimum: 5/12 from REAL data (no missing data bonuses anymore) ─────────
-    if score < 5:
-        return False, f"Fundamental score {score}/12 too low — real data insufficient", 0, []
+    # ── Minimum: 9/14 from REAL data, plus the coverage gate above ─────────────
+    if score < 9:
+        return False, f"Fundamental score {score}/14 too low — real data insufficient", 0, []
 
     return True, "", score, card
 
@@ -1814,7 +1827,7 @@ def fmt_buy_alert(sig: dict) -> str:
         f"   T2 profit   : +₹{t2_profit:,.0f}\n"
         f"\n"
         f"{'─'*28}\n"
-        f"🏢 <b>FUNDAMENTALS</b>  ({sig['f_score']}/12)\n"
+        f"🏢 <b>FUNDAMENTALS</b>  ({sig['f_score']}/14)\n"
         f"   ROE        :  {roe_s}\n"
         f"   ROCE       :  {roce_s}\n"
         f"   D/E        :  {de_s}\n"
@@ -1899,7 +1912,7 @@ def fmt_target_hit(symbol, tnum, tprice, cmp, pct, is_t2=False):
 
 SHEET_HEADERS = [
     "Scan Time","Symbol","Sector","Conviction","Score /30",
-    "Fund /12","Trend /8","Entry /10","Hold Timeframe",
+    "Fund /14","Trend /8","Entry /10","Hold Timeframe",
     "Buy Price","SL","T1 5%","T2 10%","T3 15%","RR",
     "ROE %","ROCE %","D/E","Net Margin %","EPS Growth %",
     "Rev Growth %","FCF Cr","Promoter %","Pledging %","Piotroski",
@@ -2072,12 +2085,13 @@ def run_scan(label="Morning Scan"):
                 f_fail += 1
                 continue
 
-            # Minimum Tier 1 score: 6/12
-            if f_score < 6:
-                log.info(f"         ✗ Fundamental score {f_score}/12 below minimum (6)")
+            # Redundant safety check — fundamental_score() itself already
+            # gates at 9/14, this just guards against future threshold drift
+            if f_score < 9:
+                log.info(f"         ✗ Fundamental score {f_score}/14 below minimum (9)")
                 f_fail += 1
                 continue
-            log.info(f"         ✓ Fundamental score {f_score}/12")
+            log.info(f"         ✓ Fundamental score {f_score}/14")
 
             # ── Tier 2: Trend & EMA Stack ─────────────────────────────────────
             df = fetch_ohlcv(symbol)
@@ -2220,7 +2234,7 @@ if __name__ == "__main__":
         fd = fetch_fundamentals(sym)
         passes, reason, f_score, f_card = fundamental_score(sym, sector, fd)
         print(f"\n── Fundamentals ──────────────────────────")
-        print(f"Passes: {passes}  Score: {f_score}/12")
+        print(f"Passes: {passes}  Score: {f_score}/14")
         print(f"{'Fail reason: '+reason if not passes else ''}")
         for c in f_card: print(f"  {c}")
 
@@ -2270,7 +2284,7 @@ if __name__ == "__main__":
             sec = sector_of(sym)
             fd  = fetch_fundamentals(sym)
             ok, reason, fs, card = fundamental_score(sym, sec, fd)
-            status = f"✅ {fs:2}/12  {', '.join(card[:3])}" if ok else f"✗  {reason}"
+            status = f"✅ {fs:2}/14  {', '.join(card[:3])}" if ok else f"✗  {reason}"
             print(f"{sym:15} {status}")
             if ok: passed.append(sym)
         print(f"\n{len(passed)}/{len(universe)} pass fundamental filter.")
