@@ -1,0 +1,56 @@
+name: NSE Pro Watcher
+
+# Runs the lightweight open-trade tracker on its own frequent schedule --
+# kept separate from scanner.yml because that job can take up to 90 minutes
+# and can't be scheduled every 15 minutes without overlapping itself. This
+# job just checks current price against SL/T1/T2/T3 for whatever is marked
+# OPEN in the Google Sheet, so it finishes in well under a minute per run.
+
+on:
+  # schedule:
+  #   - cron: "*/15 4-9 * * 1-5"   # ~9:30 AM - 3:30 PM IST, every 15 min, Mon-Fri
+  workflow_dispatch: {}
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write .env file
+        run: |
+          echo "TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}" >> .env
+          echo "TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> .env
+          echo "SHEETS_DOC_NAME=${{ secrets.SHEETS_DOC_NAME }}" >> .env
+          echo "SHEETS_CRED_FILE=service_account.json" >> .env
+
+      - name: Write Sheets credentials
+        run: echo '${{ secrets.SHEETS_CRED_JSON }}' > service_account.json
+
+      - name: Run watcher
+        run: python scanner.py watch
+
+      - name: Upload log
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: watcher-log-${{ github.run_id }}
+          path: scanner.log
+          retention-days: 7
