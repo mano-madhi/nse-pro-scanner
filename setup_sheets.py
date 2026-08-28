@@ -13,7 +13,7 @@ NAME = os.getenv("SHEETS_DOC_NAME",  "NSE Pro Tracker")
 
 HEADERS = [
     "Scan Time","Symbol","Sector","Conviction","Score /30",
-    "Fund /12","Trend /8","Entry /10","Hold Timeframe",
+    "Fund /14","Trend /8","Entry /10","Hold Timeframe",
     "Buy Price","SL","T1 5%","T2 10%","T3 15%","RR",
     "ROE %","ROCE %","D/E","Net Margin %","EPS Growth %",
     "Rev Growth %","FCF Cr","Promoter %","Pledging %","Piotroski",
