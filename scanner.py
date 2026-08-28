@@ -1564,21 +1564,19 @@ def build_signal(symbol: str, sector: str,
         return None
 
     # ── TECHNICAL TARGET CALCULATION ─────────────────────────────────────────
-    # Based on: (1) Resistance zones above entry, (2) Measured move from SL distance
-    # NOT fixed percentages — every stock gets its own technical targets
+    # Purely structural: resistance zones above entry, or a measured-move
+    # multiple of THIS stock's own SL distance when no resistance exists.
+    # No fixed percentage floors — a stock with resistance close by should
+    # get a close T1, not one artificially pushed out to hit a minimum %.
 
     sl_dist = close - sl          # actual risk per share (measured move unit)
     buy_ref = buy_high            # reference from top of buy zone
 
-    # Measured move targets using SL distance as unit
+    # Measured move targets using SL distance as unit — used only when there's
+    # no resistance zone to anchor to, never as a floor on top of one.
     mm_t1 = buy_ref + 2.0 * sl_dist    # 2:1 reward
     mm_t2 = buy_ref + 4.0 * sl_dist    # 4:1 reward
     mm_t3 = buy_ref + 6.0 * sl_dist    # 6:1 reward
-
-    # Minimum technical floors (ensures T always above buy price)
-    min_t1 = buy_ref * 1.03    # at least 3% above buy
-    min_t2 = buy_ref * 1.07    # at least 7% above buy
-    min_t3 = buy_ref * 1.12    # at least 12% above buy
 
     # Get all resistance zones above entry from S/R analysis
     sr_zones = entry_data.get("sr_zones", {})
@@ -1587,28 +1585,31 @@ def build_signal(symbol: str, sector: str,
         [r["level"] for r in resistances if r["level"] > buy_ref * 1.02],
     )
 
-    # T1 — first resistance above entry OR measured move, whichever is lower
-    # (take the closer target as T1 — book profits at first opportunity)
+    # T1 — first resistance above entry OR measured move, WHICHEVER IS CLOSER
+    # (book profits at the first realistic opportunity, don't overreach)
     if res_above:
-        res_t1 = res_above[0] * 0.998   # just below resistance
-        t1 = max(min(res_t1, mm_t1), min_t1)
+        t1 = min(res_above[0] * 0.998, mm_t1)
     else:
-        t1 = max(mm_t1, min_t1)
+        t1 = mm_t1
 
-    # T2 — second resistance OR measured move
+    # T2 — second resistance OR measured move, whichever is FARTHER (extension target)
     if len(res_above) >= 2:
-        res_t2 = res_above[1] * 0.998
-        t2 = max(res_t2, mm_t2, min_t2)
+        t2 = max(res_above[1] * 0.998, mm_t2)
     else:
-        t2 = max(mm_t2, min_t2)
+        t2 = mm_t2
 
-    # T3 — extended measured move (no resistance cap — let it run)
-    t3 = max(mm_t3, min_t3)
+    # T3 — third resistance if it exists, else extended measured move (let it run)
+    if len(res_above) >= 3:
+        t3 = max(res_above[2] * 0.998, mm_t3)
+    else:
+        t3 = mm_t3
 
-    # Safety: strict ordering — T1 < T2 < T3, all above buy_high
-    t1 = round(max(t1, buy_ref * 1.02), 2)
-    t2 = round(max(t2, t1 * 1.03), 2)
-    t3 = round(max(t3, t2 * 1.03), 2)
+    # Safety: strict ordering only — T1 < T2 < T3, all above buy_high.
+    # Bumps use THIS stock's own SL distance (its real volatility unit) to
+    # break a tie, never a blind percentage.
+    t1 = round(max(t1, buy_ref + 0.5 * sl_dist), 2)
+    t2 = round(max(t2, t1 + 0.5 * sl_dist), 2)
+    t3 = round(max(t3, t2 + 0.5 * sl_dist), 2)
 
     # ── Risk : Reward (based on T2) ───────────────────────────────────────────
     # No minimum enforced here anymore — target and SL both come from real
@@ -2060,16 +2061,16 @@ def watch_open_trades():
             _tg(fmt_target_hit(sym, 1, t1, cmp, 5))
             sh.update_cell(row_num, notes_c + 1, (row[notes_c] + " T1").strip())
             sh.update_cell(row_num, sl_c + 1, buy_high)   # move SL to breakeven
-            sh.update_cell(row_num, stat_c + 1, "T1 HIT (SL->breakeven)")
+            sh.update_cell(row_num, stat_c + 1, "T1 HIT (5%)")
 
         elif t1_done and not t2_done and cmp >= t2:
             _tg(fmt_target_hit(sym, 2, t2, cmp, 10, is_t2=True))
             sh.update_cell(row_num, notes_c + 1, (row[notes_c] + " T2").strip())
-            sh.update_cell(row_num, stat_c + 1, "T2 HIT")
+            sh.update_cell(row_num, stat_c + 1, "T2 HIT (10%)")
 
         elif t2_done and cmp >= t3:
             _tg(fmt_target_hit(sym, 3, t3, cmp, 15))
-            sh.update_cell(row_num, stat_c + 1, "T3 HIT — CLOSED")
+            sh.update_cell(row_num, stat_c + 1, "T3 HIT (15%)")
             sh.update_cell(row_num, exit_c + 1, cmp)
             sh.update_cell(row_num, pnl_c + 1, f"{(cmp-buy_high)/buy_high*100:.2f}%")
 
