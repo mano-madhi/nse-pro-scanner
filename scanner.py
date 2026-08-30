@@ -1913,6 +1913,25 @@ def fmt_target_hit(symbol, tnum, tprice, cmp, pct, is_t2=False):
     )
 
 
+def fmt_entry_triggered(symbol, cmp, sl, t1, t2, t3):
+    """
+    Sent when a stock we already flagged earlier has now crossed its
+    original buy zone -- CMP is fresh, but SL/T1/T2/T3 are the exact same
+    numbers given the first time this stock was flagged, never recomputed.
+    """
+    return (
+        f"🔔 <b>ENTRY TRIGGERED — {symbol}</b>\n"
+        f"Already flagged earlier — buy zone now crossed.\n"
+        f"Buy at CMP ₹{cmp:.2f}\n\n"
+        f"SL     :  ₹{sl}  (unchanged from original signal)\n"
+        f"T1     :  ₹{t1}\n"
+        f"T2     :  ₹{t2}\n"
+        f"T3     :  ₹{t3}\n\n"
+        f"<i>Targets and SL are the same as originally given — only the "
+        f"entry price has moved since then.</i>"
+    )
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # 10. GOOGLE SHEETS
 # ════════════════════════════════════════════════════════════════════════════
@@ -2083,6 +2102,100 @@ def watch_open_trades():
 # 12. MAIN SCAN PIPELINE
 # ════════════════════════════════════════════════════════════════════════════
 
+def get_open_positions() -> dict:
+    """
+    Reads every OPEN row from the Signals sheet ONCE at the start of a scan.
+    Used to skip re-scoring/re-alerting a stock that's already been flagged
+    and hasn't resolved yet — the FundsIndia-style behavior: a stock gets
+    its entry/target/SL levels ONCE, and later scans either stay silent
+    (price still hasn't reached the original buy zone) or announce "buy at
+    CMP" using the SAME original target/SL (price has now crossed into or
+    past the original zone) — never a freshly recomputed target/SL for a
+    stock that's already been given one.
+    """
+    client = sheets_client()
+    if not client:
+        return {}
+    try:
+        sh = client.open(SHEETS_DOC_NAME).worksheet("Signals")
+        data = sh.get_all_values()
+    except Exception as e:
+        log.warning(f"Could not read open positions: {e}")
+        return {}
+    if len(data) < 2:
+        return {}
+
+    hdr = data[0]
+    def col(name):
+        return hdr.index(name)
+
+    sym_c, stat_c = col("Symbol"), col("Status")
+    buy_c, sl_c   = col("Buy Price"), col("SL")
+    t1_c, t2_c, t3_c = col("T1 5%"), col("T2 10%"), col("T3 15%")
+    notes_c = col("Notes")
+
+    # Still "active" (not eligible for a fresh new signal) covers OPEN plus
+    # partial-target states -- only SL HIT and T3 HIT are truly terminal.
+    # A position that's already hit T1 (SL moved to breakeven) is still very
+    # much running toward T2/T3 and must not be treated as free to re-flag.
+    STILL_ACTIVE = {"OPEN", "T1 HIT (5%)", "T2 HIT (10%)"}
+
+    open_pos = {}
+    for i, row in enumerate(data[1:], start=2):
+        if row[stat_c].strip() not in STILL_ACTIVE:
+            continue
+        try:
+            open_pos[row[sym_c]] = {
+                "row_num": i,
+                "buy_high": float(row[buy_c]),
+                "sl": float(row[sl_c]),
+                "t1": float(row[t1_c]),
+                "t2": float(row[t2_c]),
+                "t3": float(row[t3_c]),
+                "entry_alerted": "ENTRY" in row[notes_c],
+                "notes": row[notes_c],
+            }
+        except (ValueError, IndexError):
+            continue
+    return open_pos
+
+
+def check_and_alert_open_position(symbol: str, pos: dict):
+    """
+    For a stock that already has an OPEN row: fetch CMP, then either stay
+    silent (still below original buy zone) or send a one-time "entry
+    triggered, buy at CMP" alert reusing the ORIGINAL stored target/SL —
+    never recomputed. Marks the row so this only fires once per position.
+    """
+    try:
+        d = yf.download(nse(symbol), period="1d", interval="5m",
+                         auto_adjust=True, progress=False)
+        if d.empty:
+            return
+        cmp = float(d["Close"].iloc[-1])
+    except Exception:
+        return
+
+    if cmp < pos["buy_high"]:
+        log.info(f"         ↻ Already flagged, still below buy zone (CMP ₹{cmp:.2f} < ₹{pos['buy_high']:.2f}) — waiting")
+        return
+
+    if pos["entry_alerted"]:
+        log.info(f"         ↻ Already flagged and entry already alerted — watcher is tracking it")
+        return
+
+    log.info(f"         🔔 Already-flagged stock crossed into buy zone — sending entry-at-CMP alert")
+    _tg(fmt_entry_triggered(symbol, cmp, pos["sl"], pos["t1"], pos["t2"], pos["t3"]))
+    try:
+        client = sheets_client()
+        sh = client.open(SHEETS_DOC_NAME).worksheet("Signals")
+        notes_c = sh.row_values(1).index("Notes") + 1   # 1-based for update_cell
+        new_notes = (pos["notes"] + " ENTRY").strip()
+        sh.update_cell(pos["row_num"], notes_c, new_notes)
+    except Exception as e:
+        log.warning(f"Could not mark entry-alerted: {e}")
+
+
 def run_scan(label="Morning Scan"):
     sep = "═" * 55
     log.info(sep)
@@ -2091,6 +2204,9 @@ def run_scan(label="Morning Scan"):
 
     universe = build_universe()
     log.info(f"  Universe: {len(universe)} stocks")
+
+    open_positions = get_open_positions()
+    log.info(f"  Already-open positions (won't get new levels): {len(open_positions)}")
     log.info(sep)
 
     signals = []
@@ -2099,6 +2215,12 @@ def run_scan(label="Morning Scan"):
     for i, symbol in enumerate(universe):
         sector = sector_of(symbol)
         log.info(f"[{i+1:3}/{len(universe)}] {symbol:15} ({sector[:20]})")
+
+        # Already flagged and unresolved — never recompute new levels for it.
+        # Just check whether CMP has now crossed the ORIGINAL buy zone.
+        if symbol in open_positions:
+            check_and_alert_open_position(symbol, open_positions[symbol])
+            continue
 
         try:
             # ── Tier 1: Fundamentals ──────────────────────────────────────────
