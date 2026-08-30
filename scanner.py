@@ -904,11 +904,15 @@ def fetch_ohlcv(symbol: str, period="1y", interval="1d") -> pd.DataFrame | None:
             # session, so a stock scored strong at 9:20 AM shows identical
             # entry/SL/target at 3:00 PM the same day. Levels then update once
             # per day, when a new session actually finalizes -- not per run.
-            today_ist = pd.Timestamp.now(tz="Asia/Kolkata").normalize()
-            last_bar_date = df.index[-1]
-            last_bar_date = (last_bar_date.tz_localize(None)
-                              if last_bar_date.tzinfo else last_bar_date).normalize()
-            if last_bar_date >= today_ist:
+            #
+            # Compared as plain .date() objects, not pd.Timestamp, to sidestep
+            # tz-aware vs tz-naive comparison errors -- a date has no timezone
+            # ambiguity, which is all this check actually needs.
+            today_ist_date = datetime.now(IST).date()
+            last_bar_ts = df.index[-1]
+            last_bar_date = (last_bar_ts.tz_localize(None) if last_bar_ts.tzinfo
+                              else last_bar_ts).date()
+            if last_bar_date >= today_ist_date:
                 df = df.iloc[:-1]
                 if df.empty or len(df) < 120:
                     return None
