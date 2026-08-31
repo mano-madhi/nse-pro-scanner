@@ -172,6 +172,22 @@ CURATED_FALLBACK = ALL_STOCKS
 def nse(sym):
     return f"{sym}.NS"
 
+def get_live_price(sym: str) -> float | None:
+    """
+    Quick current-price check used only as a sanity gate before trusting a
+    signal whose entry/SL/target were computed off yesterday's (or Friday's,
+    over a weekend) completed candle. Returns None on any failure so callers
+    can fall back to trusting the reference close rather than blocking.
+    """
+    try:
+        d = yf.download(nse(sym), period="1d", interval="5m",
+                         auto_adjust=True, progress=False)
+        if d.empty:
+            return None
+        return float(d["Close"].iloc[-1])
+    except Exception:
+        return None
+
 _DYNAMIC_SECTOR_CACHE: dict = {}
 
 def sector_of(sym):
@@ -2303,6 +2319,30 @@ def run_scan(label="Morning Scan"):
             if sig is None:
                 log.info(f"         ✗ Signal rejected (RR too poor or SL invalid)")
                 continue
+
+            # ── Live-price gap check ───────────────────────────────────────────
+            # buy_low/buy_high/SL/targets are all anchored to the last FULLY
+            # COMPLETED candle (yesterday's close, or Friday's over a weekend)
+            # -- necessary to stop same-day levels drifting between the 9:20 AM
+            # and 3:00 PM runs, but it means build_signal has zero visibility
+            # into what actually happened at today's open. If price has since
+            # gapped away from that reference (news, a weak/strong open), the
+            # calculated zone is stale before the alert even goes out. Check
+            # live price here and reject anything where the gap has already
+            # invalidated the setup, rather than sending a stale recommendation.
+            live_cmp = get_live_price(symbol)
+            if live_cmp is not None:
+                gap_pct = (live_cmp - sig["close"]) / sig["close"] * 100
+                if live_cmp <= sig["sl"]:
+                    log.info(f"         ✗ Rejected — already at/below SL at live price "
+                              f"(CMP ₹{live_cmp:.2f}, gap {gap_pct:+.1f}% since reference close)")
+                    continue
+                if abs(gap_pct) > 3.0:
+                    log.info(f"         ✗ Rejected — {gap_pct:+.1f}% gap since reference close "
+                              f"(CMP ₹{live_cmp:.2f} vs ref ₹{sig['close']:.2f}) — zone is stale")
+                    continue
+            else:
+                log.info("         ⚠ Could not verify live price — proceeding on reference close only")
 
             log.info(
                 f"         ✅ SIGNAL — {sig['conviction']} | "
