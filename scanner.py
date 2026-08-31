@@ -2062,8 +2062,14 @@ def watch_open_trades():
     exit_c, pnl_c   = col("Exit Price"), col("P&L %")
     notes_c         = col("Notes")
 
+    # Same active-state set as get_open_positions() in run_scan -- a position
+    # that already hit T1 (SL moved to breakeven) or T2 is still very much
+    # running toward the next target and must keep being watched. Only SL HIT
+    # and T3 HIT are terminal and should stop appearing here.
+    STILL_ACTIVE = {"OPEN", "T1 HIT (5%)", "T2 HIT (10%)"}
+
     open_rows = [(i, row) for i, row in enumerate(data[1:], start=2)
-                 if row[stat_c].strip() == "OPEN"]
+                 if row[stat_c].strip() in STILL_ACTIVE]
     if not open_rows:
         log.info("No open trades to watch.")
         return
