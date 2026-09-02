@@ -172,21 +172,33 @@ CURATED_FALLBACK = ALL_STOCKS
 def nse(sym):
     return f"{sym}.NS"
 
-def get_live_price(sym: str) -> float | None:
+def get_live_price(sym: str, retries: int = 2, backoff_sec: float = 1.5) -> float | None:
     """
     Quick current-price check used only as a sanity gate before trusting a
     signal whose entry/SL/target were computed off yesterday's (or Friday's,
     over a weekend) completed candle. Returns None on any failure so callers
     can fall back to trusting the reference close rather than blocking.
+
+    Retries a couple of times with a short backoff first, since failures here
+    are usually the brief Yahoo-side crumb/401 bursts (self-resolving within
+    seconds) rather than a real data gap. The reason for the final failure is
+    logged at DEBUG so it's diagnosable without being noisy in normal runs.
     """
-    try:
-        d = yf.download(nse(sym), period="1d", interval="5m",
-                         auto_adjust=True, progress=False)
-        if d.empty:
-            return None
-        return float(d["Close"].iloc[-1])
-    except Exception:
-        return None
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            d = yf.download(nse(sym), period="1d", interval="5m",
+                             auto_adjust=True, progress=False)
+            if d.empty:
+                last_exc = RuntimeError("empty dataframe")
+            else:
+                return float(d["Close"].iloc[-1])
+        except Exception as e:
+            last_exc = e
+        if attempt < retries:
+            time.sleep(backoff_sec)
+    log.info(f"         (live price fetch failed for {sym} after {retries + 1} attempt(s): {last_exc})")
+    return None
 
 _DYNAMIC_SECTOR_CACHE: dict = {}
 
